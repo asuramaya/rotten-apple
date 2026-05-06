@@ -1,0 +1,19 @@
+# build artifacts
+/target/
+**/*.rs.bk
+*.rej
+*.orig
+
+# editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# large local-only blobs not part of the source repo
+/AppleInc.iCloud_*.appx
+
+# codex marker (touch file, regenerated)
+/.codex
+
+# claude project workspace (per-machine)
+/.claude/

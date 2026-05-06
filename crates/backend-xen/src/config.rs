@@ -52,6 +52,29 @@ pub struct DomainConfigPlan {
     pub nics: Vec<NicPlan>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskFormat {
+    /// Raw block device or raw file. Source is treated byte-for-byte.
+    Raw,
+    /// qcow2 file — needs the qemu disk backend to interpret the
+    /// copy-on-write metadata. Cloud images (Ubuntu, Debian) ship as
+    /// qcow2; instance overlays we create are qcow2.
+    Qcow2,
+    /// vhd / vhdx — Hyper-V era disk format. Same backend as qcow2.
+    Vhd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskBackend {
+    /// `phy:` — raw block device handed to xen-blkback in dom0.
+    /// Lowest overhead, but only works on real block devices, not files.
+    Phy,
+    /// `qdisk:` — qemu emulates the disk for the guest. Required for
+    /// qcow2 / vhd / raw-file. ~80 MB extra dom0 RAM per HVM guest
+    /// (the qemu-dm process), so we only choose it when we must.
+    Qdisk,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskPlan {
     /// Bare host path — `/dev/nvme0n1`, no `phy:` prefix.
@@ -59,6 +82,8 @@ pub struct DiskPlan {
     /// Guest-side device name — `xvda`, `xvdb`, …
     pub vdev: String,
     pub readwrite: bool,
+    pub format: DiskFormat,
+    pub backend: DiskBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,10 +101,13 @@ impl DomainConfigPlan {
             .or(profile.storage.root.path.as_deref())
             .ok_or_else(|| BackendError::insufficient_resources(
                 "storage.root.source or storage.root.path is required for the Xen backend"))?;
+        let (root_format, root_backend) = pick_format_backend(&profile.storage.root.kind);
         let mut disks = vec![DiskPlan {
             source: strip_phy_prefix(root_src).to_string(),
             vdev: "xvda".into(),
             readwrite: !is_readonly_mode(&profile.storage.root.mode),
+            format: root_format,
+            backend: root_backend,
         }];
 
         // ---- extra disks ----
@@ -88,10 +116,13 @@ impl DomainConfigPlan {
                 .or(extra.path.as_deref())
                 .ok_or_else(|| BackendError::insufficient_resources(
                     "extra_disks[].source or extra_disks[].path is required"))?;
+            let (fmt, be) = pick_format_backend(&extra.kind);
             disks.push(DiskPlan {
                 source: strip_phy_prefix(src).to_string(),
                 vdev: format!("xvd{}", (b'b' + i as u8) as char),
                 readwrite: !is_readonly_mode(&extra.mode),
+                format: fmt,
+                backend: be,
             });
         }
 
@@ -126,6 +157,29 @@ impl DomainConfigPlan {
 
 fn strip_phy_prefix(s: &str) -> &str {
     s.strip_prefix("phy:").unwrap_or(s)
+}
+
+/// Map manifest's `storage.kind` string to the libxl format + backend
+/// pair that can read it. Cloud images and instance overlays are qcow2,
+/// which MUST go through the qemu-disk backend (the phy backend would
+/// hand the qcow2 header to the guest as if it were the boot sector).
+/// Bare block devices stay on the phy backend — lowest overhead, no
+/// qemu-dm process. Anything we don't recognise defaults to qcow2 over
+/// qdisk because guessing wrong toward "raw block" silently corrupts
+/// data while guessing wrong toward "qemu file" just costs ~80 MB.
+fn pick_format_backend(kind: &str) -> (DiskFormat, DiskBackend) {
+    match kind {
+        "block" | "raw-block" | "phy" =>
+            (DiskFormat::Raw, DiskBackend::Phy),
+        "raw" | "raw-file" =>
+            (DiskFormat::Raw, DiskBackend::Qdisk),
+        "qcow2" =>
+            (DiskFormat::Qcow2, DiskBackend::Qdisk),
+        "vhd" | "vhdx" =>
+            (DiskFormat::Vhd, DiskBackend::Qdisk),
+        _ =>
+            (DiskFormat::Qcow2, DiskBackend::Qdisk),
+    }
 }
 
 fn is_readonly_mode(mode: &str) -> bool {
@@ -270,8 +324,15 @@ impl OwnedDomainConfig {
                             return Err(e);
                         }
                     };
-                    s.backend = sys::libxl_disk_backend::LIBXL_DISK_BACKEND_PHY;
-                    s.format = sys::libxl_disk_format::LIBXL_DISK_FORMAT_RAW;
+                    s.backend = match d.backend {
+                        DiskBackend::Phy => sys::libxl_disk_backend::LIBXL_DISK_BACKEND_PHY,
+                        DiskBackend::Qdisk => sys::libxl_disk_backend::LIBXL_DISK_BACKEND_QDISK,
+                    };
+                    s.format = match d.format {
+                        DiskFormat::Raw => sys::libxl_disk_format::LIBXL_DISK_FORMAT_RAW,
+                        DiskFormat::Qcow2 => sys::libxl_disk_format::LIBXL_DISK_FORMAT_QCOW2,
+                        DiskFormat::Vhd => sys::libxl_disk_format::LIBXL_DISK_FORMAT_VHD,
+                    };
                     s.readwrite = if d.readwrite { 1 } else { 0 };
                     s.is_cdrom = 0;
                 }
@@ -460,6 +521,59 @@ mod tests {
                    "phy: prefix should be stripped — libxl wants the bare path");
         assert_eq!(plan.disks[0].vdev, "xvda");
         assert!(plan.disks[0].readwrite);
+        // kind="block" must map to the phy backend with raw format —
+        // anything else corrupts data on a real block device.
+        assert_eq!(plan.disks[0].backend, DiskBackend::Phy);
+        assert_eq!(plan.disks[0].format, DiskFormat::Raw);
+    }
+
+    #[test]
+    fn plan_qcow2_disk_uses_qdisk_backend() {
+        // Cloud images and instance overlays are qcow2. They MUST go
+        // through the qemu-disk backend; the phy backend would feed the
+        // qcow2 header to the guest as if it were the boot sector and
+        // the domain would never get past initial vcpu execution.
+        let p = load(r#"
+            [profile]
+            name = "x"
+            type = "appliance"
+            [meta]
+            [resources]
+            memory_active = "2G"
+            memory_idle = "1G"
+            memory_minimum = "512M"
+            vcpus_active = 1
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "qcow2", path = "/var/lib/x.qcow2", mode = "rw-exclusive" }
+            [tpm]
+            mode = "none"
+            [autostart]
+        "#);
+        let plan = DomainConfigPlan::from_profile(&p, XenDomainMode::Hvm).unwrap();
+        assert_eq!(plan.disks[0].backend, DiskBackend::Qdisk,
+            "qcow2 disks must use the qemu-disk backend");
+        assert_eq!(plan.disks[0].format, DiskFormat::Qcow2);
+    }
+
+    #[test]
+    fn pick_format_backend_known_kinds() {
+        assert_eq!(pick_format_backend("block"),  (DiskFormat::Raw,   DiskBackend::Phy));
+        assert_eq!(pick_format_backend("phy"),    (DiskFormat::Raw,   DiskBackend::Phy));
+        assert_eq!(pick_format_backend("raw"),    (DiskFormat::Raw,   DiskBackend::Qdisk));
+        assert_eq!(pick_format_backend("qcow2"),  (DiskFormat::Qcow2, DiskBackend::Qdisk));
+        assert_eq!(pick_format_backend("vhd"),    (DiskFormat::Vhd,   DiskBackend::Qdisk));
+        assert_eq!(pick_format_backend("vhdx"),   (DiskFormat::Vhd,   DiskBackend::Qdisk));
+    }
+
+    #[test]
+    fn pick_format_backend_unknown_defaults_to_qdisk_qcow2() {
+        // Defensive default: phy+raw on the wrong kind silently corrupts
+        // a real block device. qdisk+qcow2 just fails to attach if the
+        // file isn't qcow2 — recoverable, not destructive.
+        assert_eq!(pick_format_backend("vmdk"), (DiskFormat::Qcow2, DiskBackend::Qdisk));
+        assert_eq!(pick_format_backend(""),     (DiskFormat::Qcow2, DiskBackend::Qdisk));
     }
 
     #[test]

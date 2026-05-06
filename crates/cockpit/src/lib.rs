@@ -24,6 +24,7 @@
 //! the same `Msg` types so the UI doesn't need to know which is in use.
 
 pub mod daemon_client;
+pub mod widgets;
 
 use daemon_client::{DaemonClient, DaemonError, DaemonTransport};
 
@@ -1757,12 +1758,18 @@ enum Mode {
         handle: GuestHandle,
         /// Current allocation captured at prompt-open. Shown in the prompt
         /// so the user sees what they're moving from. Also used by the
-        /// dom0 floor warning — ballooning dom0 below current usage is
-        /// the rc=-6 (ERROR_INVAL) we keep hitting.
+        /// dom0 floor enforcement.
         current_mb: u64,
         max_mb: u64,
         options_mb: Vec<u64>,
         selected_idx: usize,
+        /// Tab cycles entry modes. Presets is the default; ManualMb and
+        /// Percentage let the user type an exact value when none of the
+        /// presets is right (e.g. stress-walking dom0 in fine steps).
+        entry_mode: BalloonEntry,
+        /// Free text for ManualMb / Percentage. Empty until the user
+        /// types something while focused on one of those modes.
+        text_input: String,
     },
     /// Memory-policy editor. We don't have an engine.get_policy RPC yet,
     /// so the editor sets but doesn't read — fields are pre-populated
@@ -1808,6 +1815,26 @@ enum Mode {
         vcpu_idx: usize,
         focus:        WizardField,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BalloonEntry { Presets, ManualMb, Percentage }
+
+impl BalloonEntry {
+    fn next(self) -> Self {
+        match self {
+            BalloonEntry::Presets    => BalloonEntry::ManualMb,
+            BalloonEntry::ManualMb   => BalloonEntry::Percentage,
+            BalloonEntry::Percentage => BalloonEntry::Presets,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            BalloonEntry::Presets    => "presets",
+            BalloonEntry::ManualMb   => "manual MB",
+            BalloonEntry::Percentage => "percentage",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1863,6 +1890,46 @@ const DOM0_FLOOR_MB: u64 = 512;
 /// and enforce the kernel-survival floor before ballooning down.
 fn is_dom0(handle: &GuestHandle) -> bool {
     handle.0 == "0"
+}
+
+/// Resolve the user's balloon target based on which entry mode is
+/// active. Presets reads `options[selected_idx]`; ManualMb parses the
+/// text as a literal MB count; Percentage parses 0-100 and computes
+/// `cap * pct / 100`. Empty text in a typed mode is rejected with a
+/// hint that nudges the user to type a number.
+fn resolve_balloon_target(
+    entry_mode: BalloonEntry,
+    text: &str,
+    options: &[u64],
+    selected_idx: usize,
+    current_mb: u64,
+    max_mb: u64,
+) -> std::result::Result<u64, String> {
+    match entry_mode {
+        BalloonEntry::Presets => Ok(options.get(selected_idx)
+            .copied()
+            .unwrap_or(current_mb.max(1))),
+        BalloonEntry::ManualMb => {
+            if text.is_empty() {
+                return Err("balloon: type a target in MB, then Enter".into());
+            }
+            text.parse::<u64>()
+                .map_err(|_| format!("balloon: '{text}' is not a valid MB count"))
+        }
+        BalloonEntry::Percentage => {
+            if text.is_empty() {
+                return Err("balloon: type 0-100 (% of max), then Enter".into());
+            }
+            let pct = text.parse::<u64>()
+                .map_err(|_| format!("balloon: '{text}' is not a valid percentage"))?;
+            if pct > 100 {
+                return Err(format!("balloon: percentage {pct} > 100"));
+            }
+            // Round-half-up so 50% of an odd cap maps to a sensible MB.
+            let cap = if max_mb > 0 { max_mb } else { current_mb };
+            Ok((cap * pct + 50) / 100)
+        }
+    }
 }
 
 /// Pure validator for the balloon prompt. Pulled out of the keyboard
@@ -2103,22 +2170,57 @@ impl State {
                     _ => { self.mode = Mode::Normal; None }
                 }
             }
-            Mode::BalloonPrompt { handle, current_mb, max_mb, options_mb, selected_idx } => {
+            Mode::BalloonPrompt {
+                handle, current_mb, max_mb, options_mb, selected_idx,
+                entry_mode, text_input,
+            } => {
                 match k.code {
-                    KeyCode::Left | KeyCode::Char('h') => {
+                    KeyCode::Tab => {
+                        *entry_mode = entry_mode.next();
+                        text_input.clear();
+                        None
+                    }
+                    KeyCode::Left | KeyCode::Char('h')
+                        if *entry_mode == BalloonEntry::Presets =>
+                    {
                         if *selected_idx > 0 { *selected_idx -= 1; }
                         None
                     }
-                    KeyCode::Right | KeyCode::Char('l') => {
+                    KeyCode::Right | KeyCode::Char('l')
+                        if *entry_mode == BalloonEntry::Presets =>
+                    {
                         if *selected_idx + 1 < options_mb.len() { *selected_idx += 1; }
+                        None
+                    }
+                    KeyCode::Char(c) if matches!(
+                        *entry_mode,
+                        BalloonEntry::ManualMb | BalloonEntry::Percentage
+                    ) && c.is_ascii_digit() => {
+                        // Cap inputs to a reasonable length so the field
+                        // can't grow unbounded; 6 digits = 999999 MB ~= 1 TB.
+                        if text_input.len() < 6 { text_input.push(c); }
+                        None
+                    }
+                    KeyCode::Backspace if matches!(
+                        *entry_mode,
+                        BalloonEntry::ManualMb | BalloonEntry::Percentage
+                    ) => {
+                        text_input.pop();
                         None
                     }
                     KeyCode::Enter => {
                         let h = handle.clone();
                         let cur = *current_mb;
                         let cap = *max_mb;
-                        let target = options_mb.get(*selected_idx).copied()
-                            .unwrap_or(cur.max(1));
+                        let target = match resolve_balloon_target(
+                            *entry_mode, text_input, options_mb, *selected_idx, cur, cap,
+                        ) {
+                            Ok(t) => t,
+                            Err(msg) => {
+                                self.toast(ToastKind::Error, msg);
+                                return None;
+                            }
+                        };
                         self.mode = Mode::Normal;
                         match validate_balloon_target(
                             target, cur, cap, is_dom0(&h)
@@ -2345,6 +2447,8 @@ impl State {
                         max_mb,
                         selected_idx: nearest_index_u64(&options_mb, current_mb),
                         options_mb,
+                        entry_mode: BalloonEntry::Presets,
+                        text_input: String::new(),
                     };
                 }
                 None
@@ -2504,9 +2608,11 @@ fn render(f: &mut Frame, state: &mut State) {
         Mode::FirstRunWelcome => render_first_run_welcome(f, area, state),
         Mode::BalloonPrompt {
             handle, current_mb, max_mb, options_mb, selected_idx,
+            entry_mode, text_input,
         } => {
             render_balloon_prompt(
                 f, area, handle, *current_mb, *max_mb, options_mb, *selected_idx,
+                *entry_mode, text_input,
             );
         }
         Mode::PolicyEditor {
@@ -2675,58 +2781,43 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
 }
 
 fn render_confirm_promote(f: &mut Frame, area: Rect) {
-    let w = 64u16;
-    let h = 8u16;
-    let overlay = centered_rect_abs(w, h, area);
-    f.render_widget(Clear, overlay);
-    let lines = vec![
-        Line::from(Span::styled(" promote Xen entry to GRUB default?",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-        Line::raw(""),
-        Line::from("  Future boots will land in Xen unless you pick another"),
-        Line::from("  entry from the GRUB menu (hold Shift at boot)."),
-        Line::from("  Bare-metal Ubuntu remains a menu choice — not deleted."),
-        Line::raw(""),
-        Line::from(Span::styled("  [y] yes, promote   [Esc/n] cancel",
-            Style::default().fg(Color::Yellow))),
-    ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" promote default "));
-    f.render_widget(p, overlay);
+    let card = widgets::confirm_card(
+        "promote default",
+        "promote Xen entry to GRUB default?",
+        vec![
+            Line::from("  Future boots will land in Xen unless you pick another"),
+            Line::from("  entry from the GRUB menu (hold Shift at boot)."),
+            Line::from("  Bare-metal Ubuntu remains a menu choice — not deleted."),
+        ],
+        "yes, promote",
+        64,
+    );
+    widgets::render_overlay_card(f, area, card);
 }
 
 fn render_confirm_boot_mode(
     f: &mut Frame, area: Rect, current: BootMode, target: BootMode,
 ) {
-    let w = 68u16;
-    let h = 9u16;
-    let overlay = centered_rect_abs(w, h, area);
-    f.render_widget(Clear, overlay);
-    let (title, blurb) = match target {
+    let (headline, blurb) = match target {
         BootMode::Cockpit => (
-            " switch boot to cockpit-only?",
+            "switch boot to cockpit-only?",
             "  Next boot will land in the cockpit on tty1; the desktop\n  will not auto-start. Reverse with [B] or `boot-mode desktop`."),
         BootMode::Desktop => (
-            " switch boot to desktop?",
+            "switch boot to desktop?",
             "  Next boot will return to the standard Ubuntu desktop.\n  The cockpit getty override is removed; DM unmasked."),
     };
-    let mut lines = vec![
-        Line::from(Span::styled(title,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-        Line::raw(""),
+    let mut body = vec![
         Line::from(format!("  current: {}    →    target: {}",
             current.label(), target.label())),
         Line::raw(""),
     ];
     for blurb_line in blurb.lines() {
-        lines.push(Line::from(blurb_line.to_string()));
+        body.push(Line::from(blurb_line.to_string()));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled("  [y] yes   [Esc] cancel",
-        Style::default().fg(Color::Yellow))));
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" boot mode "));
-    f.render_widget(p, overlay);
+    let card = widgets::confirm_card(
+        "boot mode", headline, body, "yes", 68,
+    );
+    widgets::render_overlay_card(f, area, card);
 }
 
 fn render_header(f: &mut Frame, state: &State, area: Rect) {
@@ -2962,10 +3053,11 @@ fn render_event_log(f: &mut Frame, state: &State, area: Rect) {
 }
 
 fn render_footer(f: &mut Frame, state: &State, area: Rect) {
-    // Footer reflects what's actually applicable to the selected domain.
-    // dom0 is read-mostly (no start/stop/kill); domUs gate start vs stop
-    // on the running flag so the displayed action matches what we'll
-    // actually execute on keypress.
+    // Footer is mode-aware. Inside an overlay we show the overlay's own
+    // keybindings (Tab/Esc/Enter) so the user doesn't have to guess; in
+    // Normal we show the per-domain hints + the always-relevant globals
+    // ([B]oot, [H]ost, [?]help, [q]uit). The big idea: anything the user
+    // can press right now that does something useful gets a hint.
     let mut primary: Vec<Span> = Vec::new();
     let mut secondary: Vec<Span> = Vec::new();
     let push = |s: &mut Vec<Span>, k, l| {
@@ -2977,38 +3069,73 @@ fn render_footer(f: &mut Frame, state: &State, area: Rect) {
         s.push(Span::styled(format!("[{k}]{l}"),
             Style::default().fg(Color::DarkGray)));
     };
-    match state.selected_domain() {
-        Some(d) if is_dom0(&d.handle) => {
-            dim_push(&mut primary, "s", "tart");
-            dim_push(&mut primary, "x", "Stop");
-            dim_push(&mut primary, "X", "Kill");
-            push(&mut primary, "b", "alloon");
-            push(&mut primary, "M", "policy");
-            push(&mut secondary, "n", "ew");
-            push(&mut secondary, "P", "romote");
-            push(&mut secondary, "r", "efresh");
-            push(&mut secondary, "?", "help");
-            push(&mut secondary, "q", "uit");
+    match &state.mode {
+        // Overlay-specific keybindings. We don't try to enumerate every
+        // navigation key — just the meaningful ones the user might miss.
+        Mode::HelpOverlay | Mode::HostResourcesOverlay | Mode::FirstRunWelcome => {
+            push(&mut primary, "Esc", " or any key to dismiss");
         }
-        Some(d) => {
-            let running = matches!(d.state,
-                GuestState::Running | GuestState::Idle);
-            if running { dim_push(&mut primary, "s", "tart") }
-            else       { push    (&mut primary, "s", "tart") }
-            if running { push    (&mut primary, "x", "Stop") }
-            else       { dim_push(&mut primary, "x", "Stop") }
-            push(&mut primary, "X", "Kill");
-            push(&mut primary, "b", "alloon");
-            push(&mut primary, "M", "policy");
-            push(&mut secondary, "n", "ew");
-            push(&mut secondary, "P", "romote");
-            push(&mut secondary, "r", "efresh");
-            push(&mut secondary, "?", "help");
-            push(&mut secondary, "q", "uit");
+        Mode::ConfirmKill { .. }
+        | Mode::ConfirmPromote
+        | Mode::ConfirmBootMode { .. } => {
+            push(&mut primary, "y", "es");
+            push(&mut primary, "n/Esc", " cancel");
         }
-        None => {
-            push(&mut primary, "n", "ew");
-            push(&mut primary, "P", "romote");
+        Mode::BalloonPrompt { entry_mode, .. } => {
+            match entry_mode {
+                BalloonEntry::Presets => {
+                    push(&mut primary, "←/→", " preset");
+                }
+                BalloonEntry::ManualMb | BalloonEntry::Percentage => {
+                    push(&mut primary, "0-9", " digits");
+                    push(&mut primary, "BkSp", " erase");
+                }
+            }
+            push(&mut primary, "Tab", " entry mode");
+            push(&mut primary, "Enter", " apply");
+            push(&mut primary, "Esc", " cancel");
+        }
+        Mode::PolicyEditor { .. } => {
+            push(&mut primary, "Tab", " field");
+            push(&mut primary, "←/→", " value");
+            push(&mut primary, "Enter", " apply");
+            push(&mut primary, "Esc", " cancel");
+        }
+        Mode::InstanceWizard { .. } => {
+            push(&mut primary, "Tab", " field");
+            push(&mut primary, "Enter", " create + start");
+            push(&mut primary, "Esc", " cancel");
+        }
+        // Normal mode → context-sensitive primary actions for the
+        // selected domain, plus the global navigation row.
+        Mode::Normal => {
+            match state.selected_domain() {
+                Some(d) if is_dom0(&d.handle) => {
+                    dim_push(&mut primary, "s", "tart");
+                    dim_push(&mut primary, "x", "Stop");
+                    dim_push(&mut primary, "X", "Kill");
+                    push(&mut primary, "b", "alloon");
+                    push(&mut primary, "M", "policy");
+                }
+                Some(d) => {
+                    let running = matches!(d.state,
+                        GuestState::Running | GuestState::Idle);
+                    if running { dim_push(&mut primary, "s", "tart") }
+                    else       { push    (&mut primary, "s", "tart") }
+                    if running { push    (&mut primary, "x", "Stop") }
+                    else       { dim_push(&mut primary, "x", "Stop") }
+                    push(&mut primary, "X", "Kill");
+                    push(&mut primary, "b", "alloon");
+                    push(&mut primary, "M", "policy");
+                }
+                None => {}
+            }
+            // Always-relevant globals on the second row, ordered by
+            // frequency-of-use rather than alphabetical.
+            push(&mut secondary, "n", "ew");
+            push(&mut secondary, "H", "ost");
+            push(&mut secondary, "B", "oot");
+            push(&mut secondary, "P", "romote");
             push(&mut secondary, "r", "efresh");
             push(&mut secondary, "?", "help");
             push(&mut secondary, "q", "uit");
@@ -3194,12 +3321,14 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     f.render_widget(p, overlay);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_balloon_prompt(
     f: &mut Frame, area: Rect, handle: &GuestHandle,
     current_mb: u64, max_mb: u64, options_mb: &[u64], selected_idx: usize,
+    entry_mode: BalloonEntry, text_input: &str,
 ) {
     let w = area.width.min(88);
-    let h = 10u16;
+    let h = 12u16;
     let overlay = centered_rect_abs(w, h, area);
     f.render_widget(Clear, overlay);
     let range_line = if max_mb > 0 {
@@ -3215,16 +3344,67 @@ fn render_balloon_prompt(
         Span::styled("  any value in [min, max] from the manifest",
             Style::default().fg(Color::DarkGray))
     };
+    let mode_line = Line::from(vec![
+        Span::raw("  entry: "),
+        Span::styled(entry_mode.label(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled("[Tab] cycles entry mode",
+            Style::default().fg(Color::DarkGray)),
+    ]);
+    let target_line = match entry_mode {
+        BalloonEntry::Presets =>
+            selector_line_u64("  target", options_mb, selected_idx, "MB"),
+        BalloonEntry::ManualMb => {
+            let preview = if text_input.is_empty() {
+                "____".to_string()
+            } else {
+                text_input.to_string()
+            };
+            Line::from(vec![
+                Span::raw("  target: "),
+                Span::styled(preview,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(" MB    "),
+                Span::styled("digits + Backspace; Enter applies",
+                    Style::default().fg(Color::DarkGray)),
+            ])
+        }
+        BalloonEntry::Percentage => {
+            let preview = if text_input.is_empty() {
+                "__".to_string()
+            } else {
+                text_input.to_string()
+            };
+            let cap = if max_mb > 0 { max_mb } else { current_mb };
+            let computed = text_input.parse::<u64>().ok()
+                .filter(|p| *p <= 100)
+                .map(|p| (cap * p + 50) / 100);
+            let computed_str = match computed {
+                Some(mb) => format!(" → {mb} MB"),
+                None     => String::new(),
+            };
+            Line::from(vec![
+                Span::raw("  target: "),
+                Span::styled(preview,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("%"),
+                Span::styled(computed_str,
+                    Style::default().fg(Color::Cyan)),
+                Span::raw("    "),
+                Span::styled("0-100 + Backspace; Enter applies",
+                    Style::default().fg(Color::DarkGray)),
+            ])
+        }
+    };
     let lines = vec![
         Line::from(format!(" balloon → {handle}")),
         Line::raw(""),
         Line::from(range_line),
         Line::from(floor_line),
         Line::raw(""),
-        Line::from(Span::styled(
-            "  use ←/→ to choose a target, Enter to apply",
-            Style::default().fg(Color::Yellow))),
-        selector_line_u64("  target", options_mb, selected_idx, "MB"),
+        mode_line,
+        target_line,
     ];
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" balloon "))
@@ -3358,24 +3538,21 @@ fn wizard_text_line(label: &str, value: &str, focused: bool) -> Line<'static> {
 }
 
 fn render_confirm_kill(f: &mut Frame, area: Rect, handle: &GuestHandle) {
-    let w = 60u16;
-    let h = 6u16;
-    let overlay = centered_rect_abs(w, h, area);
-    f.render_widget(Clear, overlay);
-    let lines = vec![
-        Line::from(Span::styled(" destroy guest?",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
-        Line::raw(""),
-        Line::from(format!("  This will pull the power on {handle}.")),
-        Line::from("  Unsaved guest state will be lost."),
-        Line::raw(""),
-        Line::from(Span::styled("  [y] yes   [Esc] cancel",
-            Style::default().fg(Color::Yellow))),
-    ];
-    let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" confirm "))
-        .style(Style::default().fg(Color::White));
-    f.render_widget(p, overlay);
+    let card = widgets::OverlayCard {
+        title: "confirm",
+        headline: Some(Line::from(Span::styled("destroy guest?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)))),
+        body: vec![
+            Line::from(format!("  This will pull the power on {handle}.")),
+            Line::from("  Unsaved guest state will be lost."),
+        ],
+        footer: Some(Line::from(Span::styled("  [y] yes   [Esc] cancel",
+            Style::default().fg(Color::Yellow)))),
+        width: 60,
+        height: 8,
+        accent: Color::Red,
+    };
+    widgets::render_overlay_card(f, area, card);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -3397,11 +3574,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn centered_rect_abs(w: u16, h: u16, r: Rect) -> Rect {
-    let x = r.x + (r.width.saturating_sub(w)) / 2;
-    let y = r.y + (r.height.saturating_sub(h)) / 2;
-    Rect { x, y, width: w.min(r.width), height: h.min(r.height) }
-}
+use widgets::centered_rect_abs;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -3647,6 +3820,55 @@ menuentry 'Ubuntu, with Xen hypervisor 4.20' --id 'xen-top-abc' { }
     fn validate_balloon_at_exactly_max_succeeds() {
         let r = validate_balloon_target(4096, 1856, 4096, false);
         assert_eq!(r.unwrap(), 4096);
+    }
+
+    #[test]
+    fn resolve_balloon_presets_picks_selected() {
+        let opts = vec![512u64, 1024, 2048, 4096];
+        let r = resolve_balloon_target(
+            BalloonEntry::Presets, "", &opts, 2, 1024, 4096);
+        assert_eq!(r.unwrap(), 2048);
+    }
+
+    #[test]
+    fn resolve_balloon_manual_parses_mb() {
+        let r = resolve_balloon_target(
+            BalloonEntry::ManualMb, "1500", &[], 0, 1024, 4096);
+        assert_eq!(r.unwrap(), 1500);
+    }
+
+    #[test]
+    fn resolve_balloon_manual_empty_rejects() {
+        let r = resolve_balloon_target(
+            BalloonEntry::ManualMb, "", &[], 0, 1024, 4096);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("MB"));
+    }
+
+    #[test]
+    fn resolve_balloon_percentage_computes_against_cap() {
+        // 25% of 4096 = 1024
+        let r = resolve_balloon_target(
+            BalloonEntry::Percentage, "25", &[], 0, 1024, 4096);
+        assert_eq!(r.unwrap(), 1024);
+    }
+
+    #[test]
+    fn resolve_balloon_percentage_clamps_to_100() {
+        let r = resolve_balloon_target(
+            BalloonEntry::Percentage, "150", &[], 0, 1024, 4096);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("150"));
+    }
+
+    #[test]
+    fn resolve_balloon_percentage_falls_back_to_current_when_max_zero() {
+        // Backends that don't report max should still allow %-based entry
+        // against the current value, so the user has SOME ceiling to
+        // reason about.
+        let r = resolve_balloon_target(
+            BalloonEntry::Percentage, "50", &[], 0, 2048, 0);
+        assert_eq!(r.unwrap(), 1024);
     }
 
     // ---- Daemon-mode bootstrap & translation ----------------------------

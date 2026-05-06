@@ -2999,11 +2999,17 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
         if leasable == 0 && any_iommu_off {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
-                "    IOMMU is off in dom0 cmdline — no GPUs can be passed through.",
+                "    IOMMU is off in the running kernel — no GPUs can be passed",
                 Style::default().fg(Color::Yellow))));
             lines.push(Line::from(Span::styled(
-                "    fix automatically: rotten-apple boot-mode iommu enable --reboot",
-                Style::default().fg(Color::DarkGray))));
+                "    through. The latest install (`sudo rotten-apple update`)",
+                Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(
+                "    already wrote `iommu=on intel_iommu=on amd_iommu=on` to the",
+                Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(
+                "    Xen GRUB entry — reboot to apply.",
+                Style::default().fg(Color::Yellow))));
         } else if leasable == 0 {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(

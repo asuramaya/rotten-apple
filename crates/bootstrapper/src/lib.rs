@@ -272,7 +272,15 @@ GRUB_CMDLINE_XEN_DEFAULT="dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vc
 # belt-and-braces in case the plymouth-cryptsetup hook still runs.
 # gdm picks up tty7 from systemd display-manager.service, NOT from
 # plymouth, so dropping splash does not break the desktop hand-off.
-GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 quiet plymouth.use-mode=text"
+#
+# `iommu=on intel_iommu=on amd_iommu=on` was added in v0.0.6 — without
+# these flags the dom0 kernel doesn't populate /sys/kernel/iommu_groups,
+# which means our GPU detection sees every non-framebuffer card as
+# Locked(IommuOff) and the dGPU passthrough path is unreachable.
+# `iommu=on` is the generic Xen-aware flag; the vendor-specific ones
+# are belt-and-braces and harmless on the wrong CPU (kernel ignores
+# the one that doesn't apply).
+GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 quiet plymouth.use-mode=text iommu=on intel_iommu=on amd_iommu=on"
 "#)
 }
 
@@ -731,6 +739,28 @@ mod tests {
             "Xen cmdline must keep `quiet` to suppress kernel chatter: {cmdline_value:?}");
         assert!(cmdline_value.contains("console=tty0"),
             "Xen cmdline must keep console=tty0 for the framebuffer: {cmdline_value:?}");
+    }
+
+    #[test]
+    fn grub_snippet_includes_iommu_flags_for_passthrough() {
+        // Without these the dom0 kernel doesn't populate
+        // /sys/kernel/iommu_groups; GPU detection then has no choice but
+        // to mark every non-framebuffer GPU as Locked(IommuOff), and the
+        // dGPU passthrough path is unreachable.
+        let s = grub_xen_cmdline_snippet(1856, 4);
+        let cmdline_value = s
+            .lines()
+            .find(|l| l.starts_with("GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="))
+            .expect("snippet must define cmdline line")
+            .split('"').nth(1).expect("quoted value");
+        assert!(cmdline_value.contains("iommu=on"),
+            "Xen cmdline must include iommu=on: {cmdline_value:?}");
+        // Vendor-specific flags are belt-and-braces; harmless on the
+        // wrong CPU because the kernel ignores the one that doesn't apply.
+        assert!(cmdline_value.contains("intel_iommu=on"),
+            "Xen cmdline must include intel_iommu=on: {cmdline_value:?}");
+        assert!(cmdline_value.contains("amd_iommu=on"),
+            "Xen cmdline must include amd_iommu=on: {cmdline_value:?}");
     }
 
     #[test]

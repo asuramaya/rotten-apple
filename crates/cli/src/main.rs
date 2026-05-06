@@ -1091,14 +1091,22 @@ fn cmd_instance_start(id: &str) -> ExitCode {
     }
     let socket = std::path::Path::new(
         rotten_apple_orchestratord::DEFAULT_SOCKET_PATH);
-    match rotten_apple_instances::dispatch_domain_create(socket, &manifest_path) {
-        Ok(domid) => {
-            println!("started {id}: domid {domid}");
-            ExitCode::SUCCESS
-        }
+    // libxl_domain_create_new lands the domain in *paused* state. The
+    // trait splits create from start so callers can fork or snapshot
+    // before the first instruction runs. The user-facing `instance start`
+    // wants the domain actually running, so issue both calls in sequence.
+    let domid = match rotten_apple_instances::dispatch_domain_create(socket, &manifest_path) {
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("instance start: {e}");
-            ExitCode::from(2)
+            eprintln!("instance start: domain.create: {e}");
+            return ExitCode::from(2);
         }
+    };
+    if let Err(e) = rotten_apple_instances::dispatch_domain_start(socket, domid) {
+        eprintln!("instance start: domain.start (domid {domid}): {e}");
+        eprintln!("  (domain was created but is paused — `xl unpause {domid}` to recover, or `xl destroy {domid}` to clean up)");
+        return ExitCode::from(2);
     }
+    println!("started {id}: domid {domid}");
+    ExitCode::SUCCESS
 }

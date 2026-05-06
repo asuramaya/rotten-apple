@@ -318,10 +318,23 @@ fn show_panic_recovery_screen(
 /// When they exit the shell, getty respawns (if cockpit-boot still set),
 /// or systemd cycles getty (if not). Either way they're not stranded.
 fn execute_shell_after_teardown() -> io::Result<()> {
+    let on_tty1 = is_on_systemd_cockpit_tty();
     eprintln!();
-    eprintln!("==> dropping to shell. Type `exit` to return to cockpit.");
-    eprintln!("    To permanently leave cockpit-boot mode:");
-    eprintln!("      rotten-apple boot-mode desktop && systemctl reboot");
+    eprintln!("==> rotten-apple cockpit exited.");
+    if on_tty1 {
+        eprintln!("    You are in a root shell on tty1 (the cockpit-boot tty).");
+        eprintln!();
+        eprintln!("    Common next steps:");
+        eprintln!("      rotten-apple cockpit                        relaunch the TUI");
+        eprintln!("      rotten-apple boot-mode desktop --reboot     return to gdm");
+        eprintln!("      rotten-apple recover                        panic-button: undo cockpit-boot");
+        eprintln!();
+        eprintln!("    `exit` will end this shell — systemd will NOT auto-relaunch the");
+        eprintln!("    cockpit (clean exits don't trip Restart=on-failure). Use one of");
+        eprintln!("    the commands above instead.");
+    } else {
+        eprintln!("    Dropped to shell. `exit` returns to your previous shell.");
+    }
     eprintln!();
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new("/bin/bash")
@@ -515,7 +528,40 @@ fn run_active(
     }
 
     let _ = cmd_tx.send(Cmd::Shutdown);
-    Ok(PostUiAction::None)
+    // When the cockpit was launched by the systemd cockpit-boot override
+    // on tty1, a clean exit leaves the unit stopped and tty1 goes blank
+    // with no getty (the override replaced ExecStart, so systemd won't
+    // fall back to login). Drop the user into a root shell on the same
+    // tty so they always have a way out — relaunch with `rotten-apple
+    // cockpit`, return to gdm with `boot-mode desktop --reboot`, etc.
+    if is_on_systemd_cockpit_tty() {
+        Ok(PostUiAction::DropToShell)
+    } else {
+        Ok(PostUiAction::None)
+    }
+}
+
+/// Are we the systemd-launched cockpit on tty1?
+///
+/// Two signals must agree:
+///   1. The cockpit-boot override file exists (we know we're configured
+///      to take over tty1).
+///   2. Our stdin's tty is `/dev/tty1` (we actually got launched there,
+///      not from a developer's `sudo rotten-apple cockpit` in a desktop
+///      terminal).
+///
+/// When both are true, a normal `[q]` exit needs to drop into a shell
+/// rather than letting systemd see us terminate cleanly and stop the
+/// unit (which would leave the tty blank with no recovery).
+fn is_on_systemd_cockpit_tty() -> bool {
+    let override_path = "/etc/systemd/system/getty@tty1.service.d/00-rotten-apple-cockpit.conf";
+    if !Path::new(override_path).exists() {
+        return false;
+    }
+    match std::fs::read_link("/proc/self/fd/0") {
+        Ok(p) => p == Path::new("/dev/tty1"),
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,18 +1423,27 @@ fn create_instance_then_start(
     let manifest_path = std::path::Path::new(
         rotten_apple_instances::DEFAULT_MANIFESTS_DIR
     ).join(format!("{}.toml", entry.id));
-    match call_daemon(client, msg_tx, "domain.create", json!({
+    let domid = match call_daemon(client, msg_tx, "domain.create", json!({
         "manifest_path": manifest_path.to_string_lossy(),
     })) {
-        Ok(v) => {
-            let domid = v.get("domid")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0);
-            EventEntry::success(
-                &format!("created {} → domid {domid}", entry.id))
-        }
-        Err(e) => EventEntry::error(
+        Ok(v) => v.get("domid")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        Err(e) => return EventEntry::error(
             &format!("instance {} created but daemon: {e}", entry.id)),
+    };
+    // libxl_domain_create_new lands the domain in paused state. Issue
+    // domain.start so the wizard's "create" actually runs the guest;
+    // otherwise xl list shows --p--- and the user has to know about
+    // `xl unpause` to make it go.
+    match call_daemon(client, msg_tx, "domain.start", json!({
+        "domid": domid,
+    })) {
+        Ok(_) => EventEntry::success(
+            &format!("created and started {} → domid {domid}", entry.id)),
+        Err(e) => EventEntry::error(
+            &format!("instance {} created (domid {domid}) but unpause: {e}",
+                entry.id)),
     }
 }
 
@@ -3125,7 +3180,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  H            host resources (CPU + RAM allocation)"),
         Line::from("  r            refresh now"),
         Line::from("  ?  /  F1     this help"),
-        Line::from("  q  /  Ctrl-C quit"),
+        Line::from("  q  /  Ctrl-C quit  (drops to shell on tty1; otherwise exits)"),
         Line::from("  Esc          cancel overlay / prompt"),
         Line::raw(""),
         Line::from(Span::styled("press any key to dismiss",

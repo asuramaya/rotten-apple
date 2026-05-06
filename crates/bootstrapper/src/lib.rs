@@ -264,8 +264,15 @@ GRUB_CMDLINE_XEN_DEFAULT="dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vc
 # for /dev/console and gdm/plymouth follow it; with the PV console listed
 # the framebuffer never got the foreground and post-LUKS-prompt was a
 # black screen on encrypted hosts.
-# `splash quiet` restored so plymouth runs and gdm picks up tty7.
-GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 splash quiet"
+# `splash` was dropped in v0.0.4 — under Xen, plymouth's graphical splash
+# claims the console at boot and the LUKS passphrase prompt renders
+# invisibly behind it (input still works, but no visual feedback). Without
+# splash, cryptsetup-initramfs falls through to plain text askpass on
+# /dev/console (= tty0) which is visible. `plymouth.use-mode=text` is
+# belt-and-braces in case the plymouth-cryptsetup hook still runs.
+# gdm picks up tty7 from systemd display-manager.service, NOT from
+# plymouth, so dropping splash does not break the desktop hand-off.
+GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 quiet plymouth.use-mode=text"
 "#)
 }
 
@@ -697,8 +704,33 @@ mod tests {
             "GRUB snippet must not include console=hvc0; that hides post-LUKS visuals");
         assert!(s.contains("console=tty0"),
             "GRUB snippet must keep console=tty0 for the framebuffer");
-        assert!(s.contains("splash quiet"),
-            "GRUB snippet must keep splash+quiet so plymouth runs");
+    }
+
+    #[test]
+    fn grub_snippet_drops_splash_for_visible_luks_prompt() {
+        // Under Xen, plymouth's graphical splash claims the framebuffer at
+        // boot and the LUKS passphrase prompt renders invisibly behind it.
+        // Without `splash`, cryptsetup-initramfs falls through to text-mode
+        // askpass on /dev/console (= tty0) which is visible.
+        // We assert against just the cmdline value (between the quotes),
+        // since the surrounding comments legitimately use the word
+        // "splash" to document history.
+        let s = grub_xen_cmdline_snippet(1856, 4);
+        let cmdline_value = s
+            .lines()
+            .find(|l| l.starts_with("GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="))
+            .expect("snippet must define GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT")
+            .split('"')
+            .nth(1)
+            .expect("cmdline value should be quoted");
+        assert!(!cmdline_value.contains("splash"),
+            "Xen cmdline must NOT contain `splash` (hides LUKS under Xen): {cmdline_value:?}");
+        assert!(cmdline_value.contains("plymouth.use-mode=text"),
+            "Xen cmdline must keep plymouth.use-mode=text as belt-and-braces: {cmdline_value:?}");
+        assert!(cmdline_value.contains("quiet"),
+            "Xen cmdline must keep `quiet` to suppress kernel chatter: {cmdline_value:?}");
+        assert!(cmdline_value.contains("console=tty0"),
+            "Xen cmdline must keep console=tty0 for the framebuffer: {cmdline_value:?}");
     }
 
     #[test]

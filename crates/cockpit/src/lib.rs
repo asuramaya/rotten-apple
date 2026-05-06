@@ -1797,8 +1797,15 @@ impl PolicyField {
     }
 }
 
+/// Hard floor for dom0 memory in MB. Below this the kernel typically
+/// OOMs during normal operation (page tables, slab caches, network
+/// buffers add up fast). The floor is intentionally permissive enough
+/// to allow stress-testing balloon round-trips through min/max — the
+/// previous "no shrink at all" rail prevented the use case entirely.
+const DOM0_FLOOR_MB: u64 = 512;
+
 /// Domain-0 is the host. Treat it as read-mostly: refuse start/stop/kill
-/// and warn before ballooning below current usage.
+/// and enforce the kernel-survival floor before ballooning down.
 fn is_dom0(handle: &GuestHandle) -> bool {
     handle.0 == "0"
 }
@@ -1808,7 +1815,7 @@ fn is_dom0(handle: &GuestHandle) -> bool {
 /// unit-testable without spinning up a terminal. Returns the validated
 /// target on success, or a user-facing message on rejection.
 fn validate_balloon_target(
-    target_mb: u64, current_mb: u64, max_mb: u64, is_dom0: bool,
+    target_mb: u64, _current_mb: u64, max_mb: u64, is_dom0: bool,
 ) -> std::result::Result<u64, String> {
     if target_mb == 0 {
         return Err("balloon: target must be > 0".into());
@@ -1816,9 +1823,9 @@ fn validate_balloon_target(
     if max_mb > 0 && target_mb > max_mb {
         return Err(format!("balloon: target {target_mb}M exceeds max {max_mb}M"));
     }
-    if is_dom0 && target_mb < current_mb {
+    if is_dom0 && target_mb < DOM0_FLOOR_MB {
         return Err(format!(
-            "dom0: cannot balloon below current {current_mb}M (it's the host)"));
+            "dom0: cannot balloon below {DOM0_FLOOR_MB}M (kernel survival floor)"));
     }
     Ok(target_mb)
 }
@@ -1832,13 +1839,21 @@ fn sorted_unique_u64(mut values: Vec<u64>) -> Vec<u64> {
 
 fn balloon_options_mb(current_mb: u64, max_mb: u64, is_dom0: bool) -> Vec<u64> {
     let cap = if max_mb > 0 { max_mb } else { current_mb.max(1) };
-    let floor = if is_dom0 { current_mb.max(1) } else { 1 };
+    let floor = if is_dom0 { DOM0_FLOOR_MB } else { 1 };
+    // Stress-test friendly option set: include the floor, current,
+    // ceiling, halves, quarters, and ±256/512 around current. For dom0
+    // this gives a clean ramp from DOM0_FLOOR_MB up to dom0_max_mem so
+    // the user can walk the balloon through the whole range without
+    // hand-typing numbers.
     let mut values = vec![
         floor,
         current_mb.max(floor),
         cap,
+        cap / 4,
         cap / 2,
         cap.saturating_mul(3) / 4,
+        current_mb.saturating_sub(256).max(floor),
+        current_mb.saturating_sub(512).max(floor),
         current_mb.saturating_add(256).min(cap),
         current_mb.saturating_add(512).min(cap),
     ];
@@ -3138,7 +3153,8 @@ fn render_balloon_prompt(
         format!("  current: {current_mb} M")
     };
     let floor_line = if is_dom0(handle) {
-        Span::styled("  dom0: target must be ≥ current (host is using it)",
+        Span::styled(
+            format!("  dom0: floor is {DOM0_FLOOR_MB}M (kernel-survival); ceiling is dom0_max_mem"),
             Style::default().fg(Color::DarkGray))
     } else {
         Span::styled("  any value in [min, max] from the manifest",
@@ -3534,13 +3550,21 @@ menuentry 'Ubuntu, with Xen hypervisor 4.20' --id 'xen-top-abc' { }
     }
 
     #[test]
-    fn validate_balloon_dom0_floor_blocks_below_current() {
-        // dom0 at 1856 MB, user enters 1024 — must reject (libxl rc=-6)
-        let r = validate_balloon_target(1024, 1856, 4096, true);
+    fn validate_balloon_dom0_can_shrink_to_kernel_floor() {
+        // Stress-test path: dom0 at 1856 MB, user picks 512 (the
+        // hard floor) — must accept so balloon round-trip works.
+        let r = validate_balloon_target(512, 1856, 4096, true);
+        assert_eq!(r.unwrap(), DOM0_FLOOR_MB);
+    }
+
+    #[test]
+    fn validate_balloon_dom0_rejects_below_kernel_floor() {
+        // 256 MB is below the kernel survival floor; refuse.
+        let r = validate_balloon_target(256, 1856, 4096, true);
         assert!(r.is_err());
         let msg = r.unwrap_err();
         assert!(msg.contains("dom0"));
-        assert!(msg.contains("1856"));
+        assert!(msg.contains(&DOM0_FLOOR_MB.to_string()));
     }
 
     #[test]

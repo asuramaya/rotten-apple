@@ -13,10 +13,12 @@ use std::path::Path;
 use std::process::Command;
 
 pub mod gpu;
+pub mod host_specs;
 pub mod lift_readiness;
 pub mod planner;
 pub mod topology;
 pub use gpu::{GpuDevice, GpuRole, GpuVendor, LockReason, enumerate_gpus};
+pub use host_specs::{HostSpecs, MemoryModule, GpuSpec};
 pub use lift_readiness::{IommuGroup, LiftReadiness, PciDevice};
 pub use planner::{Dom0Plan, DomUPlan, LiftPlan, plan};
 pub use topology::CpuTopology;

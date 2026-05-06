@@ -1753,6 +1753,51 @@ struct State {
     /// (microseconds) but kept on State so the [H] overlay redraws
     /// many times a second don't re-walk sysfs unnecessarily.
     gpus: Vec<rotten_apple_detect::GpuDevice>,
+    /// CPU topology — hybrid (P/E) split for Alder Lake-class hosts.
+    /// Probed once at startup; the kernel doesn't reshuffle these.
+    cpu_topology: rotten_apple_detect::CpuTopology,
+    /// Deep host hardware spec (DMI memory modules, GPU VRAM, …).
+    /// Probed once at startup since some calls (dmidecode, nvidia-smi)
+    /// spawn processes that are too expensive on every redraw.
+    host_specs: rotten_apple_detect::HostSpecs,
+    /// Filter applied to the events panel. [V] cycles through.
+    event_verbosity: EventVerbosity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventVerbosity {
+    /// Every event lands in the panel. Default — useful while debugging.
+    All,
+    /// Successes + errors only. Background info chatter is suppressed.
+    Important,
+    /// Errors only. For when you want the panel mostly empty.
+    ErrorsOnly,
+}
+
+impl EventVerbosity {
+    fn next(self) -> Self {
+        match self {
+            EventVerbosity::All        => EventVerbosity::Important,
+            EventVerbosity::Important  => EventVerbosity::ErrorsOnly,
+            EventVerbosity::ErrorsOnly => EventVerbosity::All,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            EventVerbosity::All        => "all",
+            EventVerbosity::Important  => "important",
+            EventVerbosity::ErrorsOnly => "errors only",
+        }
+    }
+    fn allows(self, kind: EventKind) -> bool {
+        match (self, kind) {
+            (EventVerbosity::All, _) => true,
+            (EventVerbosity::Important, EventKind::Info) => false,
+            (EventVerbosity::Important, _) => true,
+            (EventVerbosity::ErrorsOnly, EventKind::Error) => true,
+            (EventVerbosity::ErrorsOnly, _) => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2074,6 +2119,9 @@ impl State {
             toast: None,
             should_quit: false,
             gpus: rotten_apple_detect::enumerate_gpus(),
+            cpu_topology: rotten_apple_detect::CpuTopology::probe(),
+            host_specs: rotten_apple_detect::HostSpecs::probe(),
+            event_verbosity: EventVerbosity::All,
         }
     }
 
@@ -2533,6 +2581,21 @@ impl State {
                 self.mode = Mode::ConfirmBootMode { target };
                 None
             }
+            KeyCode::Char('L') => {
+                // Clear the event log. Useful after a noisy debug session
+                // or when the panel is blocking the eye from new lines.
+                self.events.clear();
+                self.toast(ToastKind::Info, "event log cleared".into());
+                None
+            }
+            KeyCode::Char('V') => {
+                // Cycle verbosity filter so background info chatter can
+                // be hidden when the user just wants to watch errors.
+                self.event_verbosity = self.event_verbosity.next();
+                self.toast(ToastKind::Info, format!(
+                    "events: {}", self.event_verbosity.label()));
+                None
+            }
             _ => None,
         }
     }
@@ -2660,7 +2723,10 @@ fn centered_main_rect(area: Rect) -> Rect {
 /// Full-page-ish overlay showing host CPU + memory totals, per-domain
 /// allocation, and free headroom. Triggered by `[H]` from Normal mode;
 /// any key dismisses.
-fn render_gpu_line(g: &rotten_apple_detect::GpuDevice) -> Line<'static> {
+fn render_gpu_line(
+    g: &rotten_apple_detect::GpuDevice,
+    _spec: Option<&rotten_apple_detect::GpuSpec>,
+) -> Line<'static> {
     use rotten_apple_detect::{GpuRole, LockReason};
     let glyph = match &g.role {
         GpuRole::Framebuffer => Span::styled("●", Style::default().fg(Color::Green)),
@@ -2710,6 +2776,13 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
     // CPU section
     lines.push(Line::from(Span::styled("  CPU",
         Style::default().add_modifier(Modifier::BOLD))));
+    if state.cpu_topology.is_hybrid {
+        lines.push(Line::from(format!(
+            "    hybrid topology   {} P-cores · {} E-cores  ({} logical total)",
+            state.cpu_topology.p_cores.len(),
+            state.cpu_topology.e_cores.len(),
+            state.cpu_topology.logical_cpus)));
+    }
     match host.and_then(|h| h.total_pcpus) {
         Some(total) => {
             let allocated: u32 = domains.iter()
@@ -2750,6 +2823,19 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
     // Memory section
     lines.push(Line::from(Span::styled("  Memory",
         Style::default().add_modifier(Modifier::BOLD))));
+    let mem_summary = state.host_specs.memory_summary();
+    if !mem_summary.is_empty() {
+        lines.push(Line::from(format!("    installed         {mem_summary}")));
+        for m in &state.host_specs.memory_modules {
+            let size = m.size_gb.map(|s| format!("{s} GB")).unwrap_or_default();
+            let kind = m.kind.as_deref().unwrap_or("");
+            let speed = m.speed_mts.map(|s| format!("{s} MT/s")).unwrap_or_default();
+            let part = m.part_number.as_deref().unwrap_or("");
+            lines.push(Line::from(format!(
+                "      └─ {locator:<10}  {size:<8} {kind:<6} {speed:<10} {part}",
+                locator = m.locator)));
+        }
+    }
     match host.and_then(|h| h.total_memory_mb) {
         Some(total) => {
             let domain_alloc: u64 = domains.iter()
@@ -2806,7 +2892,21 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
             Style::default().fg(Color::DarkGray))));
     } else {
         for g in &state.gpus {
-            lines.push(render_gpu_line(g));
+            let spec = state.host_specs.gpu_specs.iter()
+                .find(|s| s.bdf == g.bdf);
+            lines.push(render_gpu_line(g, spec));
+            // Indent a second line with model + VRAM when we have it,
+            // so the role line stays scannable.
+            if let Some(s) = spec
+                && (s.model.is_some() || s.vram_mb.is_some())
+            {
+                let model = s.model.as_deref().unwrap_or("");
+                let vram = s.vram_mb.map(|v| format!("{v} MB VRAM"))
+                    .unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!("        {model}  {vram}"),
+                    Style::default().fg(Color::DarkGray))));
+            }
         }
         let leasable = state.gpus.iter()
             .filter(|g| matches!(g.role, rotten_apple_detect::GpuRole::Leasable))
@@ -3001,11 +3101,27 @@ fn render_domain_list(f: &mut Frame, state: &mut State, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" domains ");
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default()
-            .add_modifier(Modifier::REVERSED | Modifier::BOLD))
-        .highlight_symbol("▸ ");
+    // Use an explicit foreground/background pair instead of REVERSED:
+    // REVERSED swaps the row's fg/bg with the terminal's defaults, which
+    // bleeds into adjacent cells on terminals that don't reset cleanly
+    // between cells (Kitty, some Konsole versions). A solid bg colour is
+    // self-contained per cell.
+    //
+    // Empty-state hint isn't a real domain row, so suppress the highlight
+    // symbol — otherwise the [▸] glyph hovers over a hint line that does
+    // nothing on Enter.
+    let has_domains = state.snapshot.as_ref()
+        .map(|s| !s.domains.is_empty())
+        .unwrap_or(false);
+    let mut list = List::new(items).block(block);
+    if has_domains {
+        list = list
+            .highlight_style(Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD))
+            .highlight_symbol("▸ ");
+    }
     f.render_stateful_widget(list, area, &mut state.list_state);
 }
 
@@ -3093,7 +3209,14 @@ fn render_detail_top(f: &mut Frame, state: &State, area: Rect) {
 }
 
 fn render_event_log(f: &mut Frame, state: &State, area: Rect) {
-    let lines: Vec<Line> = state.events.iter().rev().take(area.height as usize)
+    let title = match state.event_verbosity {
+        EventVerbosity::All        => " events ".to_string(),
+        v                          => format!(" events ({}) — [V] cycle ", v.label()),
+    };
+    let lines: Vec<Line> = state.events.iter()
+        .rev()
+        .filter(|e| state.event_verbosity.allows(e.kind))
+        .take(area.height as usize)
         .map(|e| {
             let secs = e.when.elapsed().as_secs();
             let (color, sym) = match e.kind {
@@ -3112,7 +3235,7 @@ fn render_event_log(f: &mut Frame, state: &State, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::TOP)
-        .title(" events ");
+        .title(title);
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -3201,6 +3324,7 @@ fn render_footer(f: &mut Frame, state: &State, area: Rect) {
             push(&mut secondary, "H", "ost");
             push(&mut secondary, "B", "oot");
             push(&mut secondary, "P", "romote");
+            push(&mut secondary, "L", " clear log");
             push(&mut secondary, "r", "efresh");
             push(&mut secondary, "?", "help");
             push(&mut secondary, "q", "uit");
@@ -3369,7 +3493,9 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  n            new instance (CoW overlay on a base image)"),
         Line::from("  P            promote Xen entry to GRUB default"),
         Line::from("  B            toggle next-boot UI (cockpit ⇄ desktop)"),
-        Line::from("  H            host resources (CPU + RAM allocation)"),
+        Line::from("  H            host resources (CPU + RAM + GPU allocation)"),
+        Line::from("  L            clear event log"),
+        Line::from("  V            cycle event verbosity (all / important / errors)"),
         Line::from("  r            refresh now"),
         Line::from("  ?  /  F1     this help"),
         Line::from("  q  /  Ctrl-C quit  (drops to shell on tty1; otherwise exits)"),

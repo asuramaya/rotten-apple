@@ -1,0 +1,17 @@
+[package]
+name = "rotten-apple-backend-xen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Xen backend for rotten-apple — implements HypervisorBackend via libxl FFI."
+
+[dependencies]
+rotten-apple-backend  = { path = "../backend" }
+rotten-apple-manifest = { path = "../manifest" }
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.71"
+
+[dev-dependencies]
+tempfile = "3"

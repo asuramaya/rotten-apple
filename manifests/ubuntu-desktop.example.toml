@@ -1,0 +1,92 @@
+# rotten-apple profile manifest — ubuntu-desktop
+#
+# The user's existing Ubuntu install, running as the primary desktop
+# guest. On the Xen backend, this is the dom0 (Phase 1) or the
+# privileged domU (Phase 2). On the Hyper-V backend, this is a
+# Hyper-V child partition with DDA passthrough of the iGPU.
+#
+# This manifest is portable across both backends. The orchestrator
+# core validates declared resources against the active backend's
+# capabilities at load time.
+
+[profile]
+name = "ubuntu-desktop"
+schema_version = "1"
+description = "Primary Linux daily driver — the user's existing Ubuntu install."
+type = "desktop"
+
+[meta]
+license = "personal"
+attestation_required = false
+
+# Three-tier sizing. The orchestrator's policy loop picks one based on
+# whether this guest is the active desktop, idle in the background, or
+# suspended (paused with RAM snapshotted to disk).
+[resources]
+memory_active   = "56G"   # when this is the active desktop (full power)
+memory_idle     = "8G"    # when ballooned down (background, but warm)
+memory_minimum  = "2G"    # absolute floor (orchestrator never goes below)
+vcpus_active    = 18
+vcpus_idle      = 4
+vcpus_minimum   = 2
+prefer_p_cores  = true    # active state pins to P-cores
+idle_on_e_cores = true    # idle state moves to E-cores
+
+[storage]
+# Pass the user's existing root partition through directly. No copy,
+# no snapshot, no overlay — the guest mounts the same blocks bare-metal
+# Ubuntu would. UUID matches, fstab resolves, identical boot.
+root = { kind = "passthrough", source = "/dev/nvme0n1p2", mode = "rw-exclusive" }
+extra_disks = []
+
+[network]
+mode = "bridge"
+interfaces = [
+    { name = "primary", mac = "auto", egress = "any" },
+]
+
+[gpu]
+# Active-desktop guest gets the iGPU. dGPU is left for the dom0/root to
+# assign to whichever guest declares heavy GPU work.
+mode = "passthrough"
+device = "0000:00:02.0"   # Intel Iris Xe (your iGPU)
+fallback = "paravirt"
+
+[audio]
+mode = "virtio-snd"       # mixed in dom0/root via PipeWire
+
+[input]
+keyboard = "follow_focus"  # gets keyboard when this is the active desktop
+mouse    = "follow_focus"
+
+[usb]
+mode = "policy"
+default_route = "follow_focus"
+explicit_routes = [
+    # Yubikey always to ubuntu-desktop regardless of focus
+    { vendor = "0x1050", product = "any", route = "ubuntu-desktop" },
+]
+
+[tpm]
+mode = "swtpm"            # software TPM; no hardware-rooted attestation
+
+[autostart]
+enabled = true
+delay_after_boot = "5s"
+suspend_after_idle = "never"   # primary desktop never auto-suspends
+
+[orchestration]
+priority = "primary"
+exclusive_resources = ["primary_display"]
+
+[trust]
+documented_capabilities = [
+    "Microsoft 365 sign-in (Microsoft account)",
+    "iCloud (web + native client caveats)",
+    "Microsoft Store apps via separate appliance profile",
+]
+documented_limitations = [
+    "Windows Hello for Business: not applicable (Linux guest)",
+    "Anti-cheat games: see windows-desktop profile (different backends differ)",
+    "PlayReady SL3000 / 4K DRM: depends on backend (Xen=no, Hyper-V=yes via Windows root)",
+]

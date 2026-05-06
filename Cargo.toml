@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/manifest",
+    "crates/backend",
+    "crates/detect",
+    "crates/cli",
+    "crates/backend-xen",
+    "crates/orchestrator",
+    "crates/orchestratord",
+    "crates/bootstrapper",
+    "crates/cockpit",
+    "crates/mcp-server",
+    "crates/images",
+    "crates/instances",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["rotten-apple contributors"]
+repository = "https://github.com/rotten-apple/rotten-apple"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,18 @@
+[package]
+name = "rotten-apple-bootstrapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase-2 lift driver — debootstraps a tiny dom0 root next to the existing Ubuntu install, registers the Xen GRUB entry, preserves bare-metal as fallback."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rotten-apple-detect   = { path = "../detect" }
+rotten-apple-manifest = { path = "../manifest" }
+libc                  = "0.2"
+serde_json            = "1"
+
+[dev-dependencies]
+tempfile = "3"

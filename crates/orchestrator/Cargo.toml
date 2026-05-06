@@ -1,0 +1,22 @@
+[package]
+name = "rotten-apple-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rotten-apple orchestrator daemon — runs as PID 1 inside the dom0 image, brings up guests from manifests."
+
+[[bin]]
+name = "rotten-apple-orchestrator"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rotten-apple-backend     = { path = "../backend" }
+rotten-apple-backend-xen = { path = "../backend-xen" }
+rotten-apple-manifest    = { path = "../manifest" }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

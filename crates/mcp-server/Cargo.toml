@@ -1,0 +1,20 @@
+[package]
+name = "rotten-apple-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rotten-apple MCP stdio server — exposes orchestratord as Claude Code tools"
+
+[[bin]]
+name = "rotten-apple-mcp"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = "1"
+rotten-apple-images = { path = "../images" }
+rotten-apple-instances = { path = "../instances" }
+rotten-apple-orchestratord = { path = "../orchestratord" }

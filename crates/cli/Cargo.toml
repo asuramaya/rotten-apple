@@ -1,0 +1,23 @@
+[package]
+name = "rotten-apple-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rotten-apple CLI binary."
+
+[[bin]]
+name = "rotten-apple"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+libc = "0.2"
+rotten-apple-manifest      = { path = "../manifest" }
+rotten-apple-detect        = { path = "../detect" }
+rotten-apple-backend       = { path = "../backend" }
+rotten-apple-backend-xen   = { path = "../backend-xen" }
+rotten-apple-bootstrapper  = { path = "../bootstrapper" }
+rotten-apple-cockpit       = { path = "../cockpit" }
+rotten-apple-images        = { path = "../images" }
+rotten-apple-instances     = { path = "../instances" }
+rotten-apple-orchestratord = { path = "../orchestratord" }

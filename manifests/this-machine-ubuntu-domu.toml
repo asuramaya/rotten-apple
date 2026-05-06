@@ -1,0 +1,112 @@
+# Manifest for the Phase-2 lift of THIS machine.
+#
+# Generated from `rotten-apple plan-lift` + `lift-readiness` on
+# 2026-05-04. Edit only if you know exactly what you're doing — the
+# bootstrapper will warn but not refuse if these numbers diverge from
+# the planner's recommendation.
+#
+# Targets the developer's Dell laptop (Intel i7-12700H, 64 GB DDR5,
+# Iris Xe iGPU, single NVMe). Lifts the existing Ubuntu install onto
+# Xen with this Ubuntu install becoming the primary domU; dom0 is the
+# minimal orchestrator.
+
+[profile]
+name           = "ubuntu-domu"
+schema_version = "1"
+description    = "Primary Linux desktop — this machine's existing Ubuntu install, lifted onto Xen as a domU. Whole-disk passthrough via libxl phy: backend; pygrub bootloader (kernel updates inside the guest stay live)."
+type           = "desktop"
+
+[meta]
+license              = "personal"
+attestation_required = false
+
+# ---------------------------------------------------------------------------
+# Resources — from `rotten-apple plan-lift`. Override carefully.
+#
+# dom0 reserves 1856 MB + 4 E-cores (12,13,14,15) externally; domU gets
+# the rest. Sizes encoded in absolute units, not percentages, because
+# the manifest needs to remain stable across machines if cloned.
+[resources]
+memory_active   = "60591M"   # 62703 total - 1856 dom0 - 256 safety
+memory_idle     = "30295M"   # active / 2; orchestrator balloons down when desktop unfocused
+memory_minimum  = "7573M"    # active / 8, floored at 2048M
+vcpus_active    = 12         # all P-vCPUs (0..11)
+vcpus_idle      = 6
+vcpus_minimum   = 2
+prefer_p_cores  = true
+idle_on_e_cores = false      # dom0 owns the E-cores
+
+# ---------------------------------------------------------------------------
+# Storage — whole-disk passthrough.
+#
+# Per the project's rule: storage controller stays with dom0 (xen-blkback
+# / xen-blkfront). Multiple guests will share the same physical NVMe in
+# the future (Windows appliance on a qcow2 file, etc.); PCI passthrough of
+# the NVMe controller would lock all storage into one guest.
+#
+# /dev/nvme0n1 carries:
+#   - p1: EFI System Partition (vfat, 512 MB)
+#   - p2: /boot (ext4, plaintext — pygrub reads from this)
+#   - p3: LUKS → ubuntu-vg/ubuntu-lv (ext4 root, encrypted)
+#
+# The domU will see all three. pygrub finds /boot, reads grub.cfg, picks
+# the kernel + initrd, and boots Ubuntu identically to bare-metal. The
+# LUKS passphrase prompt appears in the domU console at first boot.
+[storage]
+root = { kind = "block", source = "/dev/nvme0n1", mode = "rw-exclusive" }
+
+# ---------------------------------------------------------------------------
+# Network — single bridged NIC.
+#
+# dom0 brings up xenbr0 over the host's primary interface; the domU gets
+# a paravirt vif on that bridge. `mac = "auto"` lets libxl mint a stable
+# MAC; the domU's existing netplan/NetworkManager config stays valid.
+[network]
+mode = "bridge"
+
+[[network.interfaces]]
+name   = "primary"
+mac    = "auto"
+egress = "any"
+
+# ---------------------------------------------------------------------------
+# GPU — full passthrough of the Intel iGPU.
+#
+# Per `lift-readiness`: 0000:00:02.0 is alone in IOMMU group 0 (no
+# collateral devices). Clean passthrough; the Ubuntu domU drives the
+# laptop display directly. dom0 is headless (serial console only).
+[gpu]
+mode   = "passthrough"
+device = "0000:00:02.0"
+
+# ---------------------------------------------------------------------------
+# Audio — follows GPU into the desktop guest. The HDA controller will
+# be passed through alongside the iGPU as a separate device (or via the
+# same IOMMU group on this hardware — bootstrapper checks).
+[audio]
+mode = "passthrough"
+
+[input]
+keyboard = "follow_focus"
+mouse    = "follow_focus"
+
+[usb]
+mode          = "policy"
+default_route = "follow_focus"
+
+# ---------------------------------------------------------------------------
+# TPM — none for the Linux desktop.
+#
+# Ubuntu doesn't require a TPM at boot; LUKS unlocks via passphrase.
+# Phase 3 Windows guest is the one that needs swtpm or HW passthrough.
+# Per backend rule: tpm.mode != none would force HVM; we want PVH here.
+[tpm]
+mode = "none"
+
+[autostart]
+enabled            = true
+delay_after_boot   = "5s"
+# suspend_after_idle = "30m"  # leave unset = primary desktop never auto-suspends
+
+[orchestration]
+priority = "primary"

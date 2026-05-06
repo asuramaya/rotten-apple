@@ -1,0 +1,97 @@
+# rotten-apple profile manifest — icloud-keychain
+#
+# A minimal Windows appliance that runs Apple's iCloud Passwords helper.
+# Headless — no display, no audio, no input. Spawns on demand when the
+# user's browser opens the native-messaging port; suspends after 30s
+# idle. Steady-state cost is ~zero.
+#
+# The same manifest works on both backends. On Xen, the guest is a
+# domU with virtio-net only. On Hyper-V, it's a child partition with
+# Enhanced Session Mode disabled and a virtual switch attached.
+
+[profile]
+name = "icloud-keychain"
+schema_version = "1"
+description = "Apple iCloud Passwords helper, served via browser native messaging."
+type = "appliance"
+
+[meta]
+license = "personal"
+attestation_required = false   # iCloud Passwords doesn't gate on Microsoft attestation
+
+[resources]
+# Tiny: a Tiny11-derived image with iCloud Passwords pre-installed.
+memory_active   = "1G"
+memory_idle     = "256M"
+memory_minimum  = "128M"
+vcpus_active    = 2
+vcpus_idle      = 1
+vcpus_minimum   = 1
+prefer_p_cores  = false        # appliance is fine on E-cores
+idle_on_e_cores = true
+
+[storage]
+root = { kind = "qcow2", path = "/var/lib/rotten-apple/images/icloud-keychain.qcow2" }
+extra_disks = []
+
+[network]
+# The appliance only needs to reach Apple's CloudKit endpoints.
+# Dom0/root enforces egress filtering.
+mode = "bridge"
+interfaces = [
+    { name = "primary", mac = "auto", egress = ["*.apple.com", "*.icloud.com", "*.apple-cloudkit.com"] },
+]
+
+[gpu]
+mode = "none"
+
+[audio]
+mode = "none"
+
+[input]
+keyboard = "denied"
+mouse    = "denied"
+
+[usb]
+mode = "denied"   # appliance never gets USB
+
+[tpm]
+mode = "swtpm"
+
+[autostart]
+enabled = false
+suspend_after_idle = "30s"     # release resources aggressively when not in use
+
+[trigger]
+# What wakes this appliance from suspend.
+type = "browser-native-messaging"
+manifest_name = "com.apple.passwordmanager"
+browsers = ["firefox", "chrome", "edge"]
+
+[orchestration]
+priority = "background"
+# Multiple appliances can share the same E-cores; no exclusive resources.
+exclusive_resources = []
+
+[integration]
+# How the appliance exposes its service to the user-side guest
+# (typically ubuntu-desktop). The orchestrator wires up the matching
+# native-messaging manifest on the Ubuntu side and forwards browser
+# stdin/stdout to a vsock channel into this appliance.
+sockets = [
+    { kind = "vsock", port = 1024, role = "native-messaging-bridge" },
+]
+files = []
+clipboard = false
+
+[trust]
+documented_capabilities = [
+    "Read iCloud Keychain passwords",
+    "Read iCloud Keychain TOTP codes",
+    "Fill credentials via browser native messaging",
+]
+documented_limitations = [
+    "Cannot write new entries from this appliance (Apple's helper is read-mostly)",
+    "Requires one-time PIN authentication on first run after boot",
+    "Does not include Apple's full iCloud client (Drive, Photos, etc.) — those need a different profile",
+]

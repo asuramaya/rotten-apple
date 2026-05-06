@@ -1,0 +1,10 @@
+[package]
+name = "rotten-apple-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Profile manifest schema for rotten-apple. Hypervisor-agnostic."
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }

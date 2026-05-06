@@ -1,0 +1,9 @@
+[package]
+name = "rotten-apple-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HypervisorBackend trait — the contract every backend implements."
+
+[dependencies]
+rotten-apple-manifest = { path = "../manifest" }

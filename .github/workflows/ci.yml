@@ -1,0 +1,103 @@
+# CI for rotten-apple. Linux-only: backend-xen links libxl, which only
+# exists on Linux. The Xen runtime isn't available on GitHub runners, but
+# the backend-init tests are written to assert failure on non-dom0 hosts,
+# so they pass cleanly here.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # libxen-dev: libxl headers + .so. pkg-config: build.rs probes it
+      # for the libxl version. libclang-dev: bindgen needs libclang.
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxen-dev pkg-config libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - run: cargo build --workspace --all-targets --release
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxen-dev pkg-config libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests that touch libxl_ctx_alloc assert failure on non-dom0
+      # hosts; no Xen runtime install needed.
+      - run: cargo test --workspace --release
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxen-dev pkg-config libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - run: cargo clippy --workspace --all-targets --release -- -D warnings

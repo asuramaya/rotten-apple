@@ -1749,6 +1749,10 @@ struct State {
     mode: Mode,
     toast: Option<(Instant, String, ToastKind)>,
     should_quit: bool,
+    /// Auto-detected at startup and on `[r]efresh`. Walks /sys; cheap
+    /// (microseconds) but kept on State so the [H] overlay redraws
+    /// many times a second don't re-walk sysfs unnecessarily.
+    gpus: Vec<rotten_apple_detect::GpuDevice>,
 }
 
 #[derive(Debug, Clone)]
@@ -2069,6 +2073,7 @@ impl State {
             mode,
             toast: None,
             should_quit: false,
+            gpus: rotten_apple_detect::enumerate_gpus(),
         }
     }
 
@@ -2655,6 +2660,37 @@ fn centered_main_rect(area: Rect) -> Rect {
 /// Full-page-ish overlay showing host CPU + memory totals, per-domain
 /// allocation, and free headroom. Triggered by `[H]` from Normal mode;
 /// any key dismisses.
+fn render_gpu_line(g: &rotten_apple_detect::GpuDevice) -> Line<'static> {
+    use rotten_apple_detect::{GpuRole, LockReason};
+    let glyph = match &g.role {
+        GpuRole::Framebuffer => Span::styled("●", Style::default().fg(Color::Green)),
+        GpuRole::Leasable    => Span::styled("●", Style::default().fg(Color::Cyan)),
+        GpuRole::Locked(_)   => Span::styled("○", Style::default().fg(Color::DarkGray)),
+    };
+    let role_label = match &g.role {
+        GpuRole::Framebuffer => "framebuffer  sacred (dom0 display)".to_string(),
+        GpuRole::Leasable    => "leasable     [G to lease]".to_string(),
+        GpuRole::Locked(LockReason::IommuOff) =>
+            "locked       IOMMU off in dom0 cmdline".to_string(),
+        GpuRole::Locked(LockReason::SharedWithFramebuffer) =>
+            "locked       shares IOMMU group with framebuffer".to_string(),
+        GpuRole::Locked(LockReason::SharedWithPlatform) =>
+            "locked       shares IOMMU group with platform devices".to_string(),
+    };
+    let driver_part = g.current_driver.as_deref()
+        .map(|d| format!(" ({d})"))
+        .unwrap_or_default();
+    Line::from(vec![
+        Span::raw("    "),
+        glyph,
+        Span::raw(format!(" {} {} {} ",
+            g.vendor.label(),
+            g.bdf,
+            driver_part)),
+        Span::styled(role_label, Style::default().fg(Color::DarkGray)),
+    ])
+}
+
 fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
     let w = area.width.min(80);
     let h = area.height.min(22);
@@ -2762,11 +2798,40 @@ fn render_host_resources_overlay(f: &mut Frame, area: Rect, state: &State) {
         "    (TODO: instance overlay + image catalog tracking ships with `image pull`)",
         Style::default().fg(Color::DarkGray))));
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled("  GPU lease",
+    lines.push(Line::from(Span::styled("  GPUs",
         Style::default().add_modifier(Modifier::BOLD))));
-    lines.push(Line::from(Span::styled(
-        "    (TODO: foreground lease wires when iGPU passthrough ships)",
-        Style::default().fg(Color::DarkGray))));
+    if state.gpus.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (none detected — headless host?)",
+            Style::default().fg(Color::DarkGray))));
+    } else {
+        for g in &state.gpus {
+            lines.push(render_gpu_line(g));
+        }
+        let leasable = state.gpus.iter()
+            .filter(|g| matches!(g.role, rotten_apple_detect::GpuRole::Leasable))
+            .count();
+        let any_iommu_off = state.gpus.iter().any(|g|
+            matches!(g.role, rotten_apple_detect::GpuRole::Locked(
+                rotten_apple_detect::LockReason::IommuOff)));
+        if leasable == 0 && any_iommu_off {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "    IOMMU is off in dom0 cmdline — no GPUs can be passed through.",
+                Style::default().fg(Color::Yellow))));
+            lines.push(Line::from(Span::styled(
+                "    fix automatically: rotten-apple boot-mode iommu enable --reboot",
+                Style::default().fg(Color::DarkGray))));
+        } else if leasable == 0 {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "    no GPUs available for passthrough on this host. Guests get",
+                Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                "    virtio-gpu (Linux/Windows) or qxl (legacy) — basic 2D + 3D.",
+                Style::default().fg(Color::DarkGray))));
+        }
+    }
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(

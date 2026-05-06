@@ -743,6 +743,9 @@ dependencies = [
 [[package]]
 name = "rotten-apple-detect"
 version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "rotten-apple-images"

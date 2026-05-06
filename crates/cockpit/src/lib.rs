@@ -225,6 +225,8 @@ pub fn run(config: CockpitConfig) -> io::Result<()> {
         PostUiAction::DropToShell => execute_shell_after_teardown(),
         PostUiAction::DisableCockpitBootAndReboot =>
             execute_disable_cockpit_boot_and_reboot(),
+        PostUiAction::AttachConsole(domid) =>
+            execute_attach_console_after_teardown(domid),
     }
 }
 
@@ -366,6 +368,46 @@ fn execute_disable_cockpit_boot_and_reboot() -> io::Result<()> {
     }
 }
 
+/// `[t]` flow: terminal is already torn down. Spawn `xl console <id>`
+/// and wait. After the user detaches (Ctrl-]), re-exec the cockpit so
+/// they land back in the TUI without typing a command. On a developer
+/// host without `xl` we surface the missing binary and fall through —
+/// the user gets dumped back to their shell rather than into a broken
+/// TUI re-exec.
+fn execute_attach_console_after_teardown(domid: u32) -> io::Result<()> {
+    eprintln!();
+    eprintln!("==> attaching to domid {domid} console.");
+    eprintln!("    Press Ctrl-] to detach (returns to the cockpit).");
+    eprintln!();
+    let status = std::process::Command::new("xl")
+        .args(["console", &domid.to_string()])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!();
+            eprintln!("==> detached from domid {domid} console; restoring cockpit.");
+        }
+        Ok(s) => {
+            eprintln!();
+            eprintln!("==> xl console exited with {s}; restoring cockpit.");
+        }
+        Err(e) => {
+            eprintln!();
+            eprintln!("==> could not spawn `xl console`: {e}");
+            eprintln!("    Is xen-utils installed? (apt-get install xen-utils-4.x)");
+            return Ok(());
+        }
+    }
+    // Re-exec the cockpit so we land back in the TUI without the user
+    // having to remember the command. Uses /proc/self/exe so the path
+    // is correct regardless of where rotten-apple lives on disk.
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("/proc/self/exe")
+        .arg("cockpit")
+        .exec();
+    Err(io::Error::other(format!("re-exec cockpit failed: {err}")))
+}
+
 fn execute_reboot_after_teardown() -> io::Result<()> {
     eprintln!();
     eprintln!("==> rebooting now (TUI torn down).");
@@ -395,6 +437,9 @@ enum PostUiAction {
     DropToShell,
     /// BackendError recovery: undo cockpit-boot mode + systemctl reboot.
     DisableCockpitBootAndReboot,
+    /// `[t]` on a domain: tear down the TUI, exec `xl console <domid>`,
+    /// re-exec the cockpit when the user detaches.
+    AttachConsole(u32),
 }
 
 fn execute_lift_after_teardown(config: &CockpitConfig) -> io::Result<()> {
@@ -529,6 +574,11 @@ fn run_active(
     }
 
     let _ = cmd_tx.send(Cmd::Shutdown);
+    // [t] takes precedence: we're not really quitting, we're suspending
+    // to attach to a guest console; on detach the executor re-execs us.
+    if let Some(domid) = state.pending_console_attach {
+        return Ok(PostUiAction::AttachConsole(domid));
+    }
     // When the cockpit was launched by the systemd cockpit-boot override
     // on tty1, a clean exit leaves the unit stopped and tty1 goes blank
     // with no getty (the override replaced ExecStart, so systemd won't
@@ -1762,6 +1812,10 @@ struct State {
     host_specs: rotten_apple_detect::HostSpecs,
     /// Filter applied to the events panel. [V] cycles through.
     event_verbosity: EventVerbosity,
+    /// Set by `[t]` (terminal). On the next loop iteration the run
+    /// loop notices it, exits cleanly, and the post-UI dispatcher
+    /// runs `xl console <domid>` then re-execs the cockpit.
+    pending_console_attach: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2122,6 +2176,7 @@ impl State {
             cpu_topology: rotten_apple_detect::CpuTopology::probe(),
             host_specs: rotten_apple_detect::HostSpecs::probe(),
             event_verbosity: EventVerbosity::All,
+            pending_console_attach: None,
         }
     }
 
@@ -2594,6 +2649,33 @@ impl State {
                 self.event_verbosity = self.event_verbosity.next();
                 self.toast(ToastKind::Info, format!(
                     "events: {}", self.event_verbosity.label()));
+                None
+            }
+            KeyCode::Char('t') => {
+                // Connect to the selected guest's console. dom0 is the
+                // host — `xl console 0` would dump the host's own boot
+                // log, useful for debugging but rarely what the user
+                // means by "open this guest's terminal". Refuse with a
+                // hint instead of doing the surprising thing.
+                match self.selected_domain() {
+                    Some(d) if is_dom0(&d.handle) => {
+                        self.toast(ToastKind::Info,
+                            "dom0 console: this is the host you're already on".into());
+                    }
+                    Some(d) => {
+                        match handle_to_domid(&d.handle) {
+                            Some(id) => {
+                                self.pending_console_attach = Some(id);
+                                self.should_quit = true;
+                            }
+                            None => {
+                                self.toast(ToastKind::Error,
+                                    format!("non-numeric handle: {}", d.handle));
+                            }
+                        }
+                    }
+                    None => {}
+                }
                 None
             }
             _ => None,
@@ -3314,6 +3396,7 @@ fn render_footer(f: &mut Frame, state: &State, area: Rect) {
                     else       { dim_push(&mut primary, "x", "Stop") }
                     push(&mut primary, "X", "Kill");
                     push(&mut primary, "b", "alloon");
+                    push(&mut primary, "t", "erm");
                     push(&mut primary, "M", "policy");
                 }
                 None => {}
@@ -3488,6 +3571,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  x            graceful shutdown"),
         Line::from("  X            destroy (asks for confirmation)"),
         Line::from("  b            balloon — prompts for new MB"),
+        Line::from("  t            attach to guest console (Ctrl-] detaches)"),
         Line::from("  M            edit memory policy"),
         Line::from("  c            create from active manifest"),
         Line::from("  n            new instance (CoW overlay on a base image)"),

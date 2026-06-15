@@ -11,7 +11,6 @@ use std::process::ExitCode;
 
 use rotten_apple_backend::HypervisorBackend;
 use rotten_apple_backend_xen::XenBackend;
-use rotten_apple_bootstrapper::LiftPlan;
 use rotten_apple_bootstrapper::boot_mode;
 use rotten_apple_detect::{CpuTopology, Detection, LiftReadiness, plan};
 use rotten_apple_manifest::{BackendCapabilities, Profile};
@@ -36,11 +35,52 @@ enum Commands {
     /// Inspect host state: distro, UEFI, IOMMU, GPU, disk space, etc.
     Detect,
 
+    /// Print this node's mesh identity: NodeId + Ed25519 pubkey
+    /// fingerprint. Bootstraps the keypair on first run (writes to
+    /// /var/lib/rotten-apple/node.key, mode 0600). Use this to wire
+    /// up `[[peers]]` entries on other nodes — paste the hex pubkey
+    /// into their mesh.toml.
+    NodeInfo {
+        /// Override key path (default: /var/lib/rotten-apple/node.key).
+        /// Useful in tests / dev — production should use the default.
+        #[arg(long)]
+        key_path: Option<PathBuf>,
+        /// Override node-id file path (default: /etc/rotten-apple/node-id).
+        #[arg(long)]
+        node_id_path: Option<PathBuf>,
+        /// Print the full pubkey hex in addition to the short fingerprint.
+        /// Required when registering this node in another node's mesh.toml
+        /// under `trust.mode = "config"`.
+        #[arg(long)]
+        full_pubkey: bool,
+    },
+
     /// Lift-specific probes: partition layout, LUKS, IOMMU groups, GRUB.
     LiftReadiness,
 
-    /// Compute the recommended dom0/domU resource split for this host.
+    /// Print what `lift` WOULD do on this host, without touching anything.
+    /// Reads /proc/self/mountinfo, /dev/disk/by-uuid, and the host's
+    /// running kernel to fill in the install plan, then renders it.
+    /// Includes the recommended dom0/domU resource split.
     PlanLift,
+
+    /// Execute the lift: turn this Ubuntu install into a ThinDom0 host.
+    /// Builds a tiny dom0 cpio.gz (mmdebstrap + busybox + xen-tools +
+    /// rotten-apple), drops a GRUB entry that boots Xen + that cpio.gz,
+    /// stages the user-desktop guest manifest. Defaults to dry-run.
+    /// Bare-metal Ubuntu menuentry is preserved as the recovery path.
+    Lift {
+        /// Actually run the steps. Without this, prints the steps and exits.
+        #[arg(long)]
+        execute: bool,
+        /// Recovery mode: skip apt-install + rootfs build + kernel copy.
+        /// Just rewrite /etc/grub.d/41_rotten_apple_thindom0, run
+        /// update-grub, and verify dual entries. Use after a previous
+        /// `--execute` got far enough to land the cpio.gz but the GRUB
+        /// step bombed (e.g. a renderer bug). Implies `--execute`.
+        #[arg(long)]
+        grub_only: bool,
+    },
 
     /// Operate on profile manifests.
     Manifest {
@@ -95,20 +135,6 @@ enum Commands {
         /// Print steps without acting.
         #[arg(long)]
         dry_run: bool,
-    },
-
-    /// Phase-2 lift: debootstrap a tiny dom0 root, register a Xen GRUB
-    /// entry alongside the bare-metal Ubuntu entry. Defaults to dry-run.
-    Lift {
-        /// Path to the manifest the orchestrator will use post-lift.
-        #[arg(long)]
-        manifest: PathBuf,
-        /// Path to the orchestrator binary to install into dom0.
-        #[arg(long, default_value = "./target/release/rotten-apple-orchestrator")]
-        orchestrator: PathBuf,
-        /// Actually run the steps. Without this, prints the steps and exits.
-        #[arg(long)]
-        execute: bool,
     },
 
     /// Interactive TUI cockpit. Auto-detects host state: shows the
@@ -296,8 +322,12 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Commands::Detect => cmd_detect(),
+        Commands::NodeInfo { key_path, node_id_path, full_pubkey } =>
+            cmd_node_info(key_path, node_id_path, full_pubkey),
         Commands::LiftReadiness => cmd_lift_readiness(),
         Commands::PlanLift => cmd_plan_lift(),
+        Commands::Lift { execute, grub_only } =>
+            cmd_lift(!execute && !grub_only, grub_only),
         Commands::Manifest { action } => match action {
             ManifestAction::Validate { path } => cmd_manifest_validate(&path),
         },
@@ -325,8 +355,6 @@ fn main() -> ExitCode {
         },
         Commands::Install { dry_run } => cmd_install(dry_run),
         Commands::Update  { dry_run } => cmd_install(dry_run),
-        Commands::Lift { manifest, orchestrator, execute } =>
-            cmd_lift(manifest, orchestrator, !execute),
         Commands::Cockpit { manifest, orchestrator } =>
             cmd_cockpit(manifest, orchestrator),
         Commands::BootMode { target, reboot, font } =>
@@ -609,6 +637,71 @@ fn cmd_detect() -> ExitCode {
     }
 }
 
+fn cmd_node_info(
+    key_path: Option<PathBuf>,
+    node_id_path: Option<PathBuf>,
+    full_pubkey: bool,
+) -> ExitCode {
+    use rotten_apple_fabric::{KeyPair, NodeId};
+
+    let kp_path = key_path.unwrap_or_else(||
+        PathBuf::from("/var/lib/rotten-apple/node.key"));
+    let nid_path = node_id_path.unwrap_or_else(||
+        PathBuf::from("/etc/rotten-apple/node-id"));
+    let mid_path = PathBuf::from("/etc/machine-id");
+
+    // Best-effort role hint from /etc/hostname so first-run derivation
+    // gives nodes recognizable display names ("laptop-...", "desk-box-...").
+    let role_hint = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let node_id = match NodeId::derive_from_paths(
+        &nid_path, &mid_path, role_hint.as_deref(),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("node-info: derive node-id: {e}");
+            eprintln!("(running unprivileged? the default paths need root; try --node-id-path)");
+            return ExitCode::from(2);
+        }
+    };
+
+    let kp = match KeyPair::load_or_generate_at(&kp_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("node-info: load/generate keypair at {}: {e}", kp_path.display());
+            eprintln!("(running unprivileged? the default path is 0600 in /var/lib/; try --key-path)");
+            return ExitCode::from(2);
+        }
+    };
+    let pk = kp.public();
+
+    println!("rotten-apple v{} — node identity", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("  node id:           {}", node_id);
+    println!("  hex suffix:        {}", node_id.hex_suffix());
+    println!("  pubkey (short):    {}", pk.fingerprint_short());
+    if full_pubkey {
+        println!("  pubkey (full):     {}", pk.hex());
+    }
+    println!("  key path:          {}", kp_path.display());
+    println!("  node-id path:      {}", nid_path.display());
+    println!();
+    println!("To register THIS node on another node, add to its /etc/rotten-apple/mesh.toml:");
+    println!();
+    println!("  [[peers]]");
+    println!("  node_id = \"{}\"", node_id);
+    println!("  addr    = [\"<host-or-ip>:7042\"]");
+    if full_pubkey {
+        println!("  pubkey  = \"{}\"  # required for trust.mode=\"config\"", pk.hex());
+    } else {
+        println!("  # pubkey  = \"<re-run with --full-pubkey to print>\"");
+    }
+    ExitCode::SUCCESS
+}
+
 fn cmd_lift_readiness() -> ExitCode {
     let r = LiftReadiness::run();
     println!("rotten-apple v{} — lift-readiness report\n", env!("CARGO_PKG_VERSION"));
@@ -675,12 +768,30 @@ fn cmd_lift_readiness() -> ExitCode {
 fn yesno(b: bool) -> &'static str { if b { "yes" } else { "no" } }
 
 fn cmd_plan_lift() -> ExitCode {
+    // The plan probes the host: /proc/self/mountinfo for the user's
+    // root mount, /dev/disk/by-uuid for the UUID, uname -r + /boot
+    // for the kernel and Xen images. dry_run is irrelevant here —
+    // this command never executes — but we set it so the printed
+    // summary is honest about what mode it's describing.
+    use rotten_apple_bootstrapper::thin_dom0::ThinDom0Plan;
+    use rotten_apple_bootstrapper::thin_dom0_manifest::{
+        UserDesktopInputs, UserDesktopDisplayMode, render_user_desktop_manifest,
+    };
+    let lift_plan = match ThinDom0Plan::for_this_host(true) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("plan-lift: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Host sizing recommendation block — what the legacy planner
+    // produced. Useful as context next to the install recipe so the
+    // user can sanity-check that the dom0/domU split fits the host.
     let d = Detection::run();
     let t = CpuTopology::probe();
     let p = plan(&d, &t);
-
-    println!("rotten-apple v{} — proposed lift plan\n", env!("CARGO_PKG_VERSION"));
-    println!("host:");
+    println!("host sizing recommendation:");
     println!("  total RAM:      {} MB", d.mem_total_kb / 1024);
     println!("  logical CPUs:   {}", t.logical_cpus);
     if t.is_hybrid {
@@ -688,26 +799,52 @@ fn cmd_plan_lift() -> ExitCode {
     } else {
         println!("  CPU layout:     uniform ({} cores)", t.logical_cpus);
     }
+    println!("  dom0 suggested: {} vcpus / {} MB",
+             p.dom0.vcpus, p.dom0.memory_mb);
+    println!("  domU suggested: {} vcpus / {} MB active",
+             p.ubuntu_domu.vcpus, p.ubuntu_domu.memory_active_mb);
     println!();
 
-    println!("dom0 (orchestrator):");
-    println!("  vcpus:          {}", p.dom0.vcpus);
-    println!("  cpu pin:        {:?}", p.dom0.cpu_pin);
-    println!("  memory:         {} MB", p.dom0.memory_mb);
-    for line in &p.dom0.rationale { println!("    · {line}"); }
+    print!("{lift_plan}");
     println!();
+    println!("Preview — /etc/rotten-apple/user-desktop.toml:");
+    println!("─────────────────────────────────────────────");
+    // Use the framebuffer GPU detected at plan time so the preview
+    // matches what install will actually emit. Production default is
+    // ParavirtOnly: dom0 keeps the iGPU so cockpit stays visible on the
+    // laptop panel and the guest renders to a PV display. (Passthrough —
+    // guest takes the iGPU, dom0 goes headless — is a later explicit step.)
+    let manifest = render_user_desktop_manifest(&lift_plan, &UserDesktopInputs {
+        gpu_bdf: lift_plan.framebuffer_gpu_bdf.clone(),
+        display_mode: UserDesktopDisplayMode::ParavirtOnly,
+        tpm_mode: rotten_apple_manifest::TpmMode::None,
+        autostart_enabled: true,
+    });
+    for line in manifest.lines() {
+        println!("  {line}");
+    }
+    ExitCode::SUCCESS
+}
 
-    println!("ubuntu domU (the desktop):");
-    println!("  vcpus:          {}", p.ubuntu_domu.vcpus);
-    println!("  cpu pin:        {:?}", p.ubuntu_domu.cpu_pin);
-    println!("  memory active:  {} MB", p.ubuntu_domu.memory_active_mb);
-    println!("  memory idle:    {} MB", p.ubuntu_domu.memory_idle_mb);
-    println!("  memory min:     {} MB", p.ubuntu_domu.memory_minimum_mb);
-    for line in &p.ubuntu_domu.rationale { println!("    · {line}"); }
-    println!();
-
-    println!("(numbers are recommendations from the planner. \
-              Override per-field in the manifest if needed.)");
+fn cmd_lift(dry_run: bool, grub_only: bool) -> ExitCode {
+    use rotten_apple_bootstrapper::thin_dom0::ThinDom0Plan;
+    let mut plan = match ThinDom0Plan::for_this_host(dry_run) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("lift: pre-flight failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    plan.dry_run = dry_run;
+    let result = if grub_only {
+        plan.execute_grub_only()
+    } else {
+        plan.execute()
+    };
+    if let Err(e) = result {
+        eprintln!("lift: {e}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -740,6 +877,40 @@ fn cmd_manifest_validate(path: &PathBuf) -> ExitCode {
              p.gpu.device.as_deref().map(|d| format!(" ({d})")).unwrap_or_default());
     println!("  tpm:          {:?}", p.tpm.mode);
     println!("  attestation:  required={}", p.attestation_required());
+
+    // Mesh-aware sections — empty/absent = no constraint, surface that
+    // explicitly so users see them and can opt in. Only print when the
+    // section says something interesting; an entirely-default manifest
+    // shouldn't grow noise.
+    let anchor_pinned = p.anchor.node.is_some();
+    if anchor_pinned || p.anchor.migratable {
+        let pin = p.anchor.node.as_deref().unwrap_or("(none)");
+        let mig = if p.anchor.migratable { "yes" } else { "no" };
+        println!("  anchor:       node={pin} migratable={mig}");
+    }
+    let caps = &p.capabilities_required;
+    let any_cap = caps.need_iommu
+        || caps.need_gpu_class.is_some()
+        || caps.need_pcpu_min.is_some()
+        || caps.need_memory_mb_min.is_some();
+    if any_cap {
+        let mut bits = Vec::new();
+        if caps.need_iommu { bits.push("iommu".into()); }
+        if let Some(g) = &caps.need_gpu_class { bits.push(format!("gpu={g}")); }
+        if let Some(c) = caps.need_pcpu_min  { bits.push(format!("pcpu>={c}")); }
+        if let Some(m) = caps.need_memory_mb_min { bits.push(format!("memMB>={m}")); }
+        println!("  needs:        {}", bits.join(" "));
+    }
+    let lp = &p.lease_policy;
+    if !lp.controllers_allowed.is_empty() || !lp.operations_allowed.is_empty() {
+        let ctrl = if lp.controllers_allowed.is_empty()
+            { "(any)".into() }
+            else { lp.controllers_allowed.join(",") };
+        let ops = if lp.operations_allowed.is_empty()
+            { "(default-safe)".into() }
+            else { lp.operations_allowed.join(",") };
+        println!("  lease:        controllers={ctrl} ops={ops}");
+    }
     println!();
 
     let mut had_issues = false;
@@ -862,17 +1033,6 @@ fn preferred_install_source(current_exe: &Path) -> PathBuf {
         }
     }
     current_exe.to_path_buf()
-}
-
-fn cmd_lift(manifest: PathBuf, orchestrator: PathBuf, dry_run: bool) -> ExitCode {
-    let plan = match LiftPlan::for_this_host(manifest, orchestrator, dry_run) {
-        Ok(p) => p,
-        Err(e) => { eprintln!("plan: {e}"); return ExitCode::from(2); }
-    };
-    match plan.execute() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("lift: {e}"); ExitCode::from(2) }
-    }
 }
 
 fn fmt_bytes(b: u64) -> String {

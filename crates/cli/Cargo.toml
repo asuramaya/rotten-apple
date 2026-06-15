@@ -21,3 +21,4 @@ rotten-apple-cockpit       = { path = "../cockpit" }
 rotten-apple-images        = { path = "../images" }
 rotten-apple-instances     = { path = "../instances" }
 rotten-apple-orchestratord = { path = "../orchestratord" }
+rotten-apple-fabric        = { path = "../fabric" }

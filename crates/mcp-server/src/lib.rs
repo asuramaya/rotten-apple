@@ -189,6 +189,9 @@ fn handle_tools_call<U: UpstreamClient>(
     if name == "instance_create" {
         return handle_instance_create(&args, id, upstream);
     }
+    if name == "node_info" {
+        return handle_node_info(id);
+    }
 
     let translated = match translate_tool(name, &args) {
         Ok(t) => t,
@@ -278,6 +281,58 @@ fn ensure_base_image_present(name: &str) -> Result<(), String> {
     cat.upsert(entry);
     cat.save(catalog_path)
         .map_err(|e| format!("save image catalog {}: {e}", catalog_path.display()))
+}
+
+/// `node_info` is the first mesh-aware MCP tool. Local query only —
+/// it does NOT touch the orchestrator daemon (fabric reads
+/// /etc/machine-id + /var/lib/rotten-apple/node.key directly), so it
+/// works even on hosts where the daemon isn't running yet. Returns
+/// the local NodeId, full Ed25519 pubkey hex, and short fingerprint
+/// — everything needed to register this node as a peer in another
+/// node's mesh.toml.
+fn handle_node_info(id: Value) -> McpResponse {
+    use rotten_apple_fabric::{KeyPair, NodeId};
+    use std::path::Path;
+
+    let role_hint = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let node_id = match NodeId::derive_from_paths(
+        Path::new("/etc/rotten-apple/node-id"),
+        Path::new("/etc/machine-id"),
+        role_hint.as_deref(),
+    ) {
+        Ok(n) => n,
+        Err(e) => return McpResponse::ok(
+            tool_error_text(format!("derive node-id: {e}")), id),
+    };
+
+    let kp = match KeyPair::load_or_generate() {
+        Ok(k) => k,
+        Err(e) => return McpResponse::ok(
+            tool_error_text(format!(
+                "load/generate keypair: {e} \
+                 (running unprivileged? default path is /var/lib/rotten-apple/node.key)")),
+            id,
+        ),
+    };
+    let pk = kp.public();
+
+    let payload = json!({
+        "node_id":            node_id.as_str(),
+        "hex_suffix":         node_id.hex_suffix(),
+        "pubkey_full_hex":    pk.hex(),
+        "pubkey_fingerprint": pk.fingerprint_short(),
+        "key_path":           "/var/lib/rotten-apple/node.key",
+        "node_id_path":       "/etc/rotten-apple/node-id",
+        "peer_entry_toml": format!(
+            "[[peers]]\nnode_id = {:?}\naddr    = [\"<host-or-ip>:7042\"]\npubkey  = {:?}\n",
+            node_id.as_str(), pk.hex(),
+        ),
+    });
+    McpResponse::ok(tool_result_text(&payload, false), id)
 }
 
 fn handle_instance_create<U: UpstreamClient>(
@@ -479,6 +534,11 @@ pub fn tool_list() -> Vec<Tool> {
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         Tool {
+            name: "node_info",
+            description: "Return this node's mesh identity: stable NodeId (from /etc/rotten-apple/node-id, derived from /etc/machine-id on first run) plus its Ed25519 signing pubkey (loaded from /var/lib/rotten-apple/node.key, generated on first run). Local query — does NOT require orchestratord to be running. Use this when wiring up the rotten-apple Xen mesh: copy the returned `peer_entry_toml` into another node's /etc/rotten-apple/mesh.toml under `[[peers]]` to grant this node trust on that peer.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        Tool {
             name: "domain_list",
             description: "List all domains known to the hypervisor with id, name, state, and resource usage. Cheap; use to discover domids before per-domain calls.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -618,6 +678,7 @@ mod tests {
         assert_eq!(names, vec![
             "instance_create",
             "host_info",
+            "node_info",
             "domain_list",
             "domain_get",
             "domain_start",

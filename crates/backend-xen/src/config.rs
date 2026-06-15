@@ -29,7 +29,7 @@ use crate::compat;
 use crate::ctx::map_rc;
 use crate::mode::XenDomainMode;
 use crate::sys;
-use rotten_apple_backend::{BackendError, Result};
+use rotten_apple_backend::{BackendError, PciAddr, Result};
 use rotten_apple_manifest::Profile;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
@@ -50,6 +50,23 @@ pub struct DomainConfigPlan {
     pub bootloader: Option<String>,
     pub disks: Vec<DiskPlan>,
     pub nics: Vec<NicPlan>,
+    /// Optional display device model. Explicitly populated because ThinDom0
+    /// needs a deterministic visible boot surface for "where did the LUKS
+    /// prompt go?" debugging; relying on libxl defaults produced guests with
+    /// no useful display wiring at all.
+    pub display: DisplayPlan,
+    /// PCI devices to passthrough at domain create time. Populated from
+    /// the profile's `[gpu] mode = "passthrough" device = "<bdf>"` field.
+    /// For each entry, `OwnedDomainConfig::new` allocates a
+    /// `libxl_device_pci`, calls `libxl_device_pci_init`, sets
+    /// domain/bus/dev/func, and parks it in `dc.pcidevs` so libxl
+    /// attaches the device when `libxl_domain_create_new` runs.
+    /// Pre-condition: dom0 must already have the device assignable
+    /// (xen-pciback module loaded with `xen-pciback.hide=(bdf)` on the
+    /// dom0 cmdline) — otherwise libxl errors with "device not
+    /// assignable". Seeing that error in the wild means the bootstrapper
+    /// missed wiring the cmdline.
+    pub pci_devices: Vec<PciAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +111,15 @@ pub struct NicPlan {
     pub nictype_is_ioemu: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayPlan {
+    None,
+    /// PV / PVH visible-debug path: qemu-backed VNC framebuffer + vkbd.
+    PvVnc,
+    /// HVM visible-debug path: emulated stdvga + VNC + vkbd.
+    HvmVnc,
+}
+
 impl DomainConfigPlan {
     pub fn from_profile(profile: &Profile, mode: XenDomainMode) -> Result<Self> {
         // ---- root disk ----
@@ -131,6 +157,32 @@ impl DomainConfigPlan {
         let nics: Vec<NicPlan> = profile.network.interfaces.iter()
             .map(|_| NicPlan { bridge: default_bridge_name(), nictype_is_ioemu })
             .collect();
+        let display = pick_display_plan(profile, mode);
+
+        // ---- pci passthrough ----
+        // The manifest's [gpu] section is the only producer of PCI
+        // passthrough today. mode=="passthrough" means "give the guest
+        // this physical PCI device" (typically the iGPU for a daily-
+        // desktop guest). The device BDF is parsed strictly: a malformed
+        // string is a hard error rather than silently falling back to
+        // PV framebuffer (which would leave the user staring at a black
+        // screen and no LUKS prompt — the actual failure mode reported
+        // on 2026-05-07).
+        //
+        // FUTURE: extra `[[pci_passthrough]]` entries from the manifest
+        // (dGPU, NICs, USB controllers) once the schema lands.
+        let mut pci_devices: Vec<PciAddr> = Vec::new();
+        if profile.gpu.mode == "passthrough" {
+            let bdf = profile.gpu.device.as_deref().ok_or_else(||
+                BackendError::insufficient_resources(
+                    "[gpu] mode = \"passthrough\" requires `device = \"<BDF>\"` \
+                     to identify which PCI function to attach to the guest"))?;
+            let addr: PciAddr = bdf.parse().map_err(|e: String|
+                BackendError::insufficient_resources(format!(
+                    "[gpu] device = {bdf:?}: {e} \
+                     (expected `0000:00:02.0` or `00:02.0` form)")))?;
+            pci_devices.push(addr);
+        }
 
         // ---- bootloader ----
         let bootloader = match mode {
@@ -151,6 +203,8 @@ impl DomainConfigPlan {
             bootloader,
             disks,
             nics,
+            display,
+            pci_devices,
         })
     }
 }
@@ -210,6 +264,19 @@ fn default_bridge_name_from(sys_class_net: &std::path::Path) -> String {
         .collect();
     names.sort();
     names.into_iter().next().unwrap_or_else(|| "xenbr0".into())
+}
+
+fn pick_display_plan(profile: &Profile, mode: XenDomainMode) -> DisplayPlan {
+    match profile.gpu.mode.as_str() {
+        // A visible, non-passthrough debug surface. ThinDom0 recovery uses a
+        // manifest with gpu.mode="paravirt" specifically so the guest can show
+        // an early passphrase prompt without depending on iGPU handoff.
+        "paravirt" | "virtual" => match mode {
+            XenDomainMode::Hvm => DisplayPlan::HvmVnc,
+            XenDomainMode::Pv | XenDomainMode::Pvh => DisplayPlan::PvVnc,
+        },
+        _ => DisplayPlan::None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +439,119 @@ impl OwnedDomainConfig {
                 dc.num_nics = n as i32;
             }
 
+            // ---- visible guest display ----
+            match plan.display {
+                DisplayPlan::None => {}
+                DisplayPlan::PvVnc => {
+                    let vfbs = libc::calloc(1, std::mem::size_of::<sys::libxl_device_vfb>())
+                        as *mut sys::libxl_device_vfb;
+                    if vfbs.is_null() {
+                        sys::libxl_domain_config_dispose(&mut dc);
+                        return Err(BackendError::insufficient_resources("calloc vfbs"));
+                    }
+                    let vfb = vfbs;
+                    sys::libxl_device_vfb_init(vfb);
+                    let vfb = &mut *vfb;
+                    sys::libxl_defbool_set(&mut vfb.vnc.enable, true);
+                    sys::libxl_defbool_set(&mut vfb.vnc.findunused, true);
+                    vfb.vnc.listen = match strdup("127.0.0.1") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            dc.vfbs = vfbs;
+                            dc.num_vfbs = 1;
+                            sys::libxl_domain_config_dispose(&mut dc);
+                            return Err(e);
+                        }
+                    };
+                    vfb.keymap = match strdup("en-us") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            dc.vfbs = vfbs;
+                            dc.num_vfbs = 1;
+                            sys::libxl_domain_config_dispose(&mut dc);
+                            return Err(e);
+                        }
+                    };
+                    dc.vfbs = vfbs;
+                    dc.num_vfbs = 1;
+
+                    let vkbs = libc::calloc(1, std::mem::size_of::<sys::libxl_device_vkb>())
+                        as *mut sys::libxl_device_vkb;
+                    if vkbs.is_null() {
+                        sys::libxl_domain_config_dispose(&mut dc);
+                        return Err(BackendError::insufficient_resources("calloc vkbs"));
+                    }
+                    let vkb = vkbs;
+                    sys::libxl_device_vkb_init(vkb);
+                    let vkb = &mut *vkb;
+                    vkb.backend_type = sys::libxl_vkb_backend::LIBXL_VKB_BACKEND_QEMU;
+                    dc.vkbs = vkbs;
+                    dc.num_vkbs = 1;
+                }
+                DisplayPlan::HvmVnc => {
+                    sys::libxl_defbool_set(&mut dc.b_info.u.hvm.nographic, false);
+                    dc.b_info.u.hvm.vga.kind =
+                        sys::libxl_vga_interface_type::LIBXL_VGA_INTERFACE_TYPE_STD;
+                    sys::libxl_defbool_set(&mut dc.b_info.u.hvm.vnc.enable, true);
+                    sys::libxl_defbool_set(&mut dc.b_info.u.hvm.vnc.findunused, true);
+                    dc.b_info.u.hvm.vnc.listen = match strdup("127.0.0.1") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            sys::libxl_domain_config_dispose(&mut dc);
+                            return Err(e);
+                        }
+                    };
+                    dc.b_info.u.hvm.keymap = match strdup("en-us") {
+                        Ok(p) => p,
+                        Err(e) => {
+                            sys::libxl_domain_config_dispose(&mut dc);
+                            return Err(e);
+                        }
+                    };
+                    sys::libxl_defbool_set(&mut dc.b_info.u.hvm.vkb_device, true);
+                }
+            }
+
+            // ---- pci passthrough ----
+            // Each entry becomes a libxl_device_pci in dc.pcidevs. libxl
+            // inspects this at libxl_domain_create_new and attaches each
+            // device to the new domain via xen-pciback (pre-condition:
+            // dom0 already has the device assignable, see
+            // xen-pciback.hide on the dom0 cmdline). Failure to assign
+            // surfaces from libxl_domain_create_new as "device not
+            // assignable" — typically means the bootstrapper missed the
+            // cmdline wiring or xen_pciback module isn't loaded.
+            //
+            // We leave msitranslate=false (default), permissive=false
+            // (safer — guest can only access devices the IOMMU group
+            // exposes), and rdm_policy at libxl's default (RELAXED).
+            // power_mgmt=false is the right default for GPUs (don't let
+            // the guest D3-suspend the iGPU; that breaks dom0 if the
+            // device ever rebinds).
+            if !plan.pci_devices.is_empty() {
+                let n = plan.pci_devices.len();
+                let arr = libc::calloc(n, std::mem::size_of::<sys::libxl_device_pci>())
+                    as *mut sys::libxl_device_pci;
+                if arr.is_null() {
+                    sys::libxl_domain_config_dispose(&mut dc);
+                    return Err(BackendError::insufficient_resources("calloc pcidevs"));
+                }
+                for (i, addr) in plan.pci_devices.iter().enumerate() {
+                    let slot = arr.add(i);
+                    sys::libxl_device_pci_init(slot);
+                    let s = &mut *slot;
+                    // BDF fields. libxl wants `domain` as a c_int (signed
+                    // 32-bit), `bus`/`dev`/`func` as u8. Our PciAddr.domain
+                    // is u16, so the cast widens losslessly.
+                    s.domain = addr.domain as std::os::raw::c_int;
+                    s.bus = addr.bus;
+                    s.dev = addr.device;
+                    s.func = addr.function;
+                }
+                dc.pcidevs = arr;
+                dc.num_pcidevs = n as i32;
+            }
+
             Ok(OwnedDomainConfig { inner: dc, _ctx: ctx })
         }
     }
@@ -484,6 +664,101 @@ mod tests {
         assert_eq!(plan.bootloader.as_deref(), Some("pygrub"));
         assert_eq!(plan.nics.len(), 1);
         assert!(!plan.nics[0].nictype_is_ioemu);
+        assert_eq!(plan.display, DisplayPlan::None);
+    }
+
+    #[test]
+    fn plan_pcidevs_carries_passthrough_gpu_bdf() {
+        // Pre-2026-05-07 the manifest's [gpu] mode = "passthrough"
+        // was parsed into Profile but silently dropped at the plan
+        // boundary — DomainConfigPlan had no pci_devices field. Net
+        // effect: guest launched with no GPU, no display, no visible
+        // LUKS prompt. Pin the wiring is intact: ubuntu_profile() has
+        // [gpu] passthrough device = "0000:00:02.0", the plan must
+        // carry exactly that PciAddr in pci_devices.
+        let p = ubuntu_profile();
+        let plan = DomainConfigPlan::from_profile(&p, XenDomainMode::Pvh).unwrap();
+        assert_eq!(plan.pci_devices.len(), 1,
+                   "exactly one pci passthrough device expected: {:?}",
+                   plan.pci_devices);
+        let addr = &plan.pci_devices[0];
+        assert_eq!(addr.domain, 0x0000);
+        assert_eq!(addr.bus, 0x00);
+        assert_eq!(addr.device, 0x02);
+        assert_eq!(addr.function, 0);
+    }
+
+    #[test]
+    fn plan_pcidevs_empty_when_gpu_not_passthrough() {
+        // Windows profile uses gpu mode = "virtual" (cirrus emulated
+        // via qemu). No PCI device should be requested.
+        let p = windows_profile();
+        let plan = DomainConfigPlan::from_profile(&p, XenDomainMode::Hvm).unwrap();
+        assert!(plan.pci_devices.is_empty(),
+                "non-passthrough gpu must yield no pci_devices: {:?}",
+                plan.pci_devices);
+    }
+
+    #[test]
+    fn plan_pcidevs_errors_loudly_on_passthrough_without_device() {
+        // A passthrough manifest WITHOUT a device BDF is a config bug —
+        // we'd otherwise silently start the guest with no GPU. Return
+        // a hard error so the user knows to fill in the BDF.
+        let p = load(r#"
+            [profile]
+            name = "no-bdf"
+            type = "desktop"
+            [meta]
+            [resources]
+            memory_active = "1G"
+            memory_idle = "1G"
+            memory_minimum = "512M"
+            vcpus_active = 1
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "block", source = "/dev/sda", mode = "rw-exclusive" }
+            [gpu]
+            mode = "passthrough"
+            [tpm]
+            mode = "none"
+            [autostart]
+        "#);
+        let err = DomainConfigPlan::from_profile(&p, XenDomainMode::Pvh).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("device"),
+                "error must mention missing device field: {msg}");
+    }
+
+    #[test]
+    fn plan_pcidevs_errors_loudly_on_malformed_bdf() {
+        // Garbage BDF should also be a hard error rather than
+        // silently dropping the device.
+        let p = load(r#"
+            [profile]
+            name = "bad-bdf"
+            type = "desktop"
+            [meta]
+            [resources]
+            memory_active = "1G"
+            memory_idle = "1G"
+            memory_minimum = "512M"
+            vcpus_active = 1
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "block", source = "/dev/sda", mode = "rw-exclusive" }
+            [gpu]
+            mode = "passthrough"
+            device = "not-a-bdf"
+            [tpm]
+            mode = "none"
+            [autostart]
+        "#);
+        let err = DomainConfigPlan::from_profile(&p, XenDomainMode::Pvh).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("not-a-bdf") || msg.contains("BDF"),
+                "error must mention the bad input: {msg}");
     }
 
     #[test]
@@ -493,6 +768,63 @@ mod tests {
         assert_eq!(plan.bootloader, None);
         assert_eq!(plan.nics.len(), 1);
         assert!(plan.nics[0].nictype_is_ioemu);
+        assert_eq!(plan.display, DisplayPlan::HvmVnc);
+    }
+
+    #[test]
+    fn plan_paravirt_gpu_on_pvh_gets_pv_vnc_display() {
+        let p = load(r#"
+            [profile]
+            name = "linux-debug"
+            type = "desktop"
+            [meta]
+            [resources]
+            memory_active = "2G"
+            memory_idle = "1G"
+            memory_minimum = "512M"
+            vcpus_active = 2
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "block", source = "/dev/nvme0n1", mode = "rw-exclusive" }
+            [[network.interfaces]]
+            name = "primary"
+            mac = "auto"
+            egress = "any"
+            [gpu]
+            mode = "paravirt"
+            [tpm]
+            mode = "none"
+            [autostart]
+        "#);
+        let plan = DomainConfigPlan::from_profile(&p, XenDomainMode::Pvh).unwrap();
+        assert_eq!(plan.display, DisplayPlan::PvVnc);
+    }
+
+    #[test]
+    fn plan_none_gpu_keeps_guest_headless() {
+        let p = load(r#"
+            [profile]
+            name = "service"
+            type = "service"
+            [meta]
+            [resources]
+            memory_active = "1G"
+            memory_idle = "1G"
+            memory_minimum = "512M"
+            vcpus_active = 1
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "qcow2", path = "/var/lib/service.qcow2", mode = "rw-exclusive" }
+            [gpu]
+            mode = "none"
+            [tpm]
+            mode = "none"
+            [autostart]
+        "#);
+        let plan = DomainConfigPlan::from_profile(&p, XenDomainMode::Hvm).unwrap();
+        assert_eq!(plan.display, DisplayPlan::None);
     }
 
     #[test]

@@ -33,39 +33,25 @@
 //!
 //! Bare-metal Ubuntu stays the GRUB default for the first boot.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-
-use rotten_apple_detect::{Detection, LiftReadiness, CpuTopology};
 
 mod autowire;
 pub use autowire::install_adjuncts;
 
 pub mod boot_mode;
+pub mod thin_dom0;
+pub mod thin_dom0_grub;
+pub mod thin_dom0_manifest;
+pub mod thin_dom0_rootfs;
 
 // ---------------------------------------------------------------------------
-// Public types
-
-#[derive(Debug, Clone)]
-pub struct LiftPlan {
-    /// Path on the host to the manifest the orchestrator will use.
-    pub manifest_src: PathBuf,
-    /// Path on the host to the orchestrator binary to install.
-    pub orchestrator_binary: PathBuf,
-    /// Path on the host to the `rotten-apple` CLI binary (cockpit + lift
-    /// + manifest tools — all subcommands of the same binary). Defaults
-    ///   to `/proc/self/exe` resolved through std::env::current_exe; the
-    ///   lift step copies it to /usr/local/bin/rotten-apple so post-lift
-    ///   the user can run `sudo rotten-apple cockpit` from any terminal.
-    pub cli_binary: PathBuf,
-    /// dom0_mem / dom0_max_vcpus — planner-derived from this host's RAM
-    /// and CPU topology. Bake into the Xen cmdline so dom0 is sized at
-    /// boot rather than letting it claim everything.
-    pub dom0_mem_mb: u64,
-    pub dom0_vcpus: u32,
-    /// If true, print steps without running them.
-    pub dry_run: bool,
-}
+// Error type for `install_system` and helpers below. Naming: still
+// `LiftError` because `install` is conceptually a lightweight lift —
+// the v0.0.1 LiftPlan that produced FatDom0 was removed in the
+// 2026-05-06 ThinDom0 pivot; install-thindom0 owns the full install
+// path now. This type stays for the binary-only install_system
+// (used by `rotten-apple update`).
 
 #[derive(Debug)]
 pub enum LiftError {
@@ -88,29 +74,6 @@ impl std::fmt::Display for LiftError {
 impl std::error::Error for LiftError {}
 
 pub type Result<T> = std::result::Result<T, LiftError>;
-
-impl LiftPlan {
-    pub fn for_this_host(
-        manifest_src: PathBuf,
-        orchestrator_binary: PathBuf,
-        dry_run: bool,
-    ) -> Result<Self> {
-        let detection = Detection::run();
-        let topo = CpuTopology::probe();
-        let plan = rotten_apple_detect::plan(&detection, &topo);
-        let cli_binary = std::env::current_exe()
-            .map_err(|e| LiftError::PreFlight(format!(
-                "could not locate own binary path: {e}")))?;
-        Ok(LiftPlan {
-            manifest_src,
-            orchestrator_binary,
-            cli_binary,
-            dom0_mem_mb: plan.dom0.memory_mb,
-            dom0_vcpus: plan.dom0.vcpus,
-            dry_run,
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Lightweight install (no Xen touch — just put the binary on PATH).
@@ -209,11 +172,11 @@ fn refresh_xen_cmdline_if_present(dry_run: bool) -> Result<bool> {
         Ok(s) => s,
         Err(_) => return Ok(false),
     };
-    let (mem, vcpus) = match parse_dom0_sizing_from_grub_snippet(&current) {
+    let (mem, mem_max, vcpus) = match parse_dom0_sizing_from_grub_snippet(&current) {
         Some(t) => t,
         None => return Ok(false),
     };
-    let target = grub_xen_cmdline_snippet(mem, vcpus);
+    let target = grub_xen_cmdline_snippet(mem, mem_max, vcpus);
     if current == target {
         return Ok(false);
     }
@@ -234,53 +197,82 @@ fn refresh_xen_cmdline_if_present(dry_run: bool) -> Result<bool> {
     Ok(true)
 }
 
-/// Pull `dom0_mem` (M value before the comma) and `dom0_max_vcpus` out
-/// of an existing grub.d snippet. Returns None when the snippet doesn't
-/// match the shape we wrote — in which case install leaves it alone.
-fn parse_dom0_sizing_from_grub_snippet(s: &str) -> Option<(u64, u32)> {
+/// Pull `dom0_mem` (start), `max:` (live-expand ceiling), and
+/// `dom0_max_vcpus` out of an existing grub.d snippet. Returns None when
+/// the snippet doesn't match a recognized shape — in which case install
+/// leaves it alone. Accepts both `M` and `G` suffixes for either size; the
+/// returned values are always in MB.
+fn parse_dom0_sizing_from_grub_snippet(s: &str) -> Option<(u64, u64, u32)> {
     let line = s.lines().find(|l| l.starts_with("GRUB_CMDLINE_XEN_DEFAULT="))?;
-    // dom0_mem=<N>M,max:<N>M
-    let mem = line.split("dom0_mem=").nth(1)?
-        .split('M').next()?.parse::<u64>().ok()?;
+    // dom0_mem=<start>[MG],max:<max>[MG]
+    let mem_field = line.split("dom0_mem=").nth(1)?
+        .split_whitespace().next()?;
+    let (start_tok, max_tok) = mem_field.split_once(",max:")?;
+    let start_mb = parse_mem_token_to_mb(start_tok)?;
+    let max_mb = parse_mem_token_to_mb(max_tok)?;
     let vcpus = line.split("dom0_max_vcpus=").nth(1)?
         .split_whitespace().next()?.parse::<u32>().ok()?;
-    Some((mem, vcpus))
+    Some((start_mb, max_mb, vcpus))
 }
 
-/// Single source of truth for the Xen+dom0 GRUB cmdline. Used by both the
-/// initial lift (LiftPlan::step_xen_cmdline) and the install-time refresh.
-pub(crate) fn grub_xen_cmdline_snippet(dom0_mem_mb: u64, dom0_vcpus: u32) -> String {
-    format!(r#"# Generated by rotten-apple bootstrapper.
-# Sized from `rotten-apple plan-lift`. Override by editing this file or
-# /etc/default/grub directly, then `update-grub`.
+/// Parse "<N>M" or "<N>G" → MB. Returns None on any other shape.
+fn parse_mem_token_to_mb(tok: &str) -> Option<u64> {
+    if let Some(n) = tok.strip_suffix('M') {
+        n.parse::<u64>().ok()
+    } else if let Some(n) = tok.strip_suffix('G') {
+        n.parse::<u64>().ok().map(|g| g * 1024)
+    } else {
+        None
+    }
+}
 
-# Xen hypervisor cmdline: dom0 footprint + visible console + iGPU left
-# alone (no IOMMU group for it) so i915 in dom0 can take the framebuffer
-# cleanly after EFI hands off.
-GRUB_CMDLINE_XEN_DEFAULT="dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} dom0_vcpus_pin iommu=verbose,no-igfx console=vga loglvl=all guest_loglvl=all"
+/// Single source of truth for the Xen+dom0 GRUB cmdline. Used by the
+/// install-time refresh path (refresh_xen_cmdline_if_present). Takes the
+/// dom0 boot-target memory, the ballooning ceiling, and vcpu count
+/// separately so the operator can run dom0 small at boot and grow it at
+/// runtime via `xl mem-set Domain-0 <MB>` up to the ceiling.
+pub(crate) fn grub_xen_cmdline_snippet(
+    dom0_mem_mb: u64,
+    dom0_mem_max_mb: u64,
+    dom0_vcpus: u32,
+) -> String {
+    format!(r#"# Generated by rotten-apple bootstrapper.
+# Sized from the existing on-disk file (drift-refreshed). Override by
+# editing this file or /etc/default/grub directly, then `update-grub`.
+
+# Xen hypervisor cmdline: dom0 footprint + visible console.
+# `iommu=verbose,no-igfx`: enable IOMMU with verbose logging; exclude the
+# Intel iGPU from IOMMU groups so dom0's i915 driver can drive it without
+# Xen-side DMA translation. (Xen accepts `verbose` as an enable-flag —
+# `iommu=verbose` is equivalent to `iommu=on,verbose`.)
+# `dom0_mem={dom0_mem_mb}M,max:{dom0_mem_max_mb}M`: start at {dom0_mem_mb}M,
+# allow ballooning up to {dom0_mem_max_mb}M via `xl mem-set Domain-0`.
+GRUB_CMDLINE_XEN_DEFAULT="dom0_mem={dom0_mem_mb}M,max:{dom0_mem_max_mb}M dom0_max_vcpus={dom0_vcpus} dom0_vcpus_pin iommu=verbose,no-igfx console=vga loglvl=all guest_loglvl=all"
 
 # Dom0 Linux kernel cmdline (XEN ENTRY ONLY — bare-metal entry untouched).
-# The Xen PV console (hvc0) was removed in v0.0.3 — last `console=` wins
-# for /dev/console and gdm/plymouth follow it; with the PV console listed
-# the framebuffer never got the foreground and post-LUKS-prompt was a
-# black screen on encrypted hosts.
-# `splash` was dropped in v0.0.4 — under Xen, plymouth's graphical splash
-# claims the console at boot and the LUKS passphrase prompt renders
-# invisibly behind it (input still works, but no visual feedback). Without
-# splash, cryptsetup-initramfs falls through to plain text askpass on
-# /dev/console (= tty0) which is visible. `plymouth.use-mode=text` is
-# belt-and-braces in case the plymouth-cryptsetup hook still runs.
-# gdm picks up tty7 from systemd display-manager.service, NOT from
-# plymouth, so dropping splash does not break the desktop hand-off.
 #
-# `iommu=on intel_iommu=on amd_iommu=on` was added in v0.0.6 — without
-# these flags the dom0 kernel doesn't populate /sys/kernel/iommu_groups,
-# which means our GPU detection sees every non-framebuffer card as
-# Locked(IommuOff) and the dGPU passthrough path is unreachable.
-# `iommu=on` is the generic Xen-aware flag; the vendor-specific ones
-# are belt-and-braces and harmless on the wrong CPU (kernel ignores
-# the one that doesn't apply).
-GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 quiet plymouth.use-mode=text iommu=on intel_iommu=on amd_iommu=on"
+# Display caveat (2026-05-08): under Xen PV dom0, Xen consumes the EFI GOP
+# handoff that bare-metal Linux uses to set up simpledrm. The dom0 kernel
+# boots without an early framebuffer; tty0 has no display backend until
+# i915 loads from the rootfs. LUKS prompts and early kernel printk render
+# to a void. The pre-LUKS visibility problem is sidestepped via TPM2
+# auto-unlock (see /etc/crypttab `tpm2-device=auto`); post-LUKS, gdm
+# brings up its own framebuffer via i915 from the booted rootfs.
+#
+# `console=tty0`: target the physical console for any prompts that DO
+# render (recovery shell, etc.). Last `console=` wins for /dev/console.
+# Avoid `console=hvc0` — under this Xen 4.20 build it has caused boot
+# deadlocks (2026-05-07).
+# `quiet plymouth.use-mode=text`: keep boot quiet; plymouth in text mode
+# as belt-and-braces if plymouth gets activated despite the splash drop.
+# `iommu=pt intel_iommu=on amd_iommu=on`: passthrough mode (matches
+# bare-metal Ubuntu's working cmdline, was `iommu=on` until 2026-05-08).
+# Under Xen PV, `iommu=on` (force-on) caused dom0 to attempt IOMMU
+# mappings that conflicted with Xen's `no-igfx` setting and the
+# framebuffer never came up. `iommu=pt` keeps /sys/kernel/iommu_groups
+# populated for dGPU passthrough detection without forcing translation
+# on the iGPU.
+GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="console=tty0 quiet plymouth.use-mode=text iommu=pt intel_iommu=on amd_iommu=on"
 "#)
 }
 
@@ -459,204 +451,6 @@ Keywords=xen;dom0;hypervisor;orchestrator;
 }
 
 // ---------------------------------------------------------------------------
-// Pre-flight
-
-pub fn pre_flight() -> Result<(Detection, LiftReadiness)> {
-    let det = Detection::run();
-    let lr  = LiftReadiness::run();
-    if !det.blockers.is_empty() {
-        return Err(LiftError::PreFlight(format!(
-            "Detection blockers: {}", det.blockers.join("; "))));
-    }
-    if !lr.blockers.is_empty() {
-        return Err(LiftError::PreFlight(format!(
-            "LiftReadiness blockers: {}", lr.blockers.join("; "))));
-    }
-    Ok((det, lr))
-}
-
-// ---------------------------------------------------------------------------
-// Execute
-
-impl LiftPlan {
-    pub fn execute(&self) -> Result<()> {
-        eprintln!("==> rotten-apple lift v0.0.1 (host becomes dom0): {}",
-                  if self.dry_run { "DRY RUN" } else { "EXECUTE" });
-        eprintln!("    manifest:          {}", self.manifest_src.display());
-        eprintln!("    orchestrator bin:  {}", self.orchestrator_binary.display());
-        eprintln!("    dom0_mem:          {} MB (Xen cmdline)", self.dom0_mem_mb);
-        eprintln!("    dom0_max_vcpus:    {} (Xen cmdline)", self.dom0_vcpus);
-        eprintln!();
-
-        let (_det, _lr) = pre_flight()?;
-
-        if !self.manifest_src.exists() {
-            return Err(LiftError::PreFlight(format!(
-                "manifest does not exist: {}", self.manifest_src.display())));
-        }
-        if !self.orchestrator_binary.exists() {
-            return Err(LiftError::PreFlight(format!(
-                "orchestrator binary does not exist: {}",
-                self.orchestrator_binary.display())));
-        }
-
-        // One-time-only steps (apt, GRUB cmdline). The lift handles
-        // these because they're only legal pre-Xen-boot or right after.
-        self.step_apt_install()?;
-        self.step_install_manifest()?;
-        self.step_xen_cmdline()?;
-        self.step_update_grub()?;
-        self.step_verify_dual_entry()?;
-
-        // Per-build install steps (binaries, systemd unit, MCP wiring,
-        // smoke test). install_system is the single source of truth for
-        // these — running it from lift means lift produces the same end
-        // state as a subsequent `rotten-apple update`.
-        eprintln!();
-        eprintln!("==> running per-build install (cli + daemon + mcp)");
-        install_system(&self.cli_binary, self.dry_run)?;
-
-        eprintln!();
-        eprintln!("==> lift complete.");
-        eprintln!("    Bare-metal Ubuntu stays the GRUB default.");
-        eprintln!("    Reboot, hold Shift at the GRUB menu, pick");
-        eprintln!("    'Ubuntu GNU/Linux, with Xen hypervisor'.");
-        eprintln!("    If anything goes wrong: reboot, pick 'Ubuntu' (no Xen) to recover.");
-        eprintln!();
-        eprintln!("    Post-reboot: `systemctl status rotten-apple-orchestratord`");
-        eprintln!("    + `rotten-apple cockpit` to verify the daemon round-trips.");
-        eprintln!("    Future updates: build, then `sudo rotten-apple update`.");
-        Ok(())
-    }
-
-    // ---- steps ----
-
-    fn step_apt_install(&self) -> Result<()> {
-        // xen-system-amd64 is the meta-package: hypervisor + xen-utils +
-        // libxl runtime + xen-tools + grub helpers that auto-add a
-        // 'Ubuntu, with Xen hypervisor' menuentry when update-grub runs.
-        // No-install-recommends to keep dom0 lean (no qemu-system-x86,
-        // no docs).
-        self.run_with_env("apt install xen-system",
-            "apt-get",
-            &["install", "-y", "--no-install-recommends", "xen-system-amd64"],
-            &[("DEBIAN_FRONTEND", "noninteractive")])
-    }
-
-    fn step_install_manifest(&self) -> Result<()> {
-        let dst = Path::new("/etc/rotten-apple/active.toml");
-        if self.dry_run {
-            self.step_log("install manifest",
-                &format!("would copy {} -> {}",
-                         self.manifest_src.display(), dst.display()));
-            return Ok(());
-        }
-        std::fs::create_dir_all(dst.parent().unwrap()).map_err(|e|
-            LiftError::Command { step: "mkdir /etc/rotten-apple",
-                                 detail: e.to_string() })?;
-        std::fs::copy(&self.manifest_src, dst).map_err(|e|
-            LiftError::Command { step: "copy manifest", detail: e.to_string() })?;
-        self.step_log("install manifest", &format!("→ {}", dst.display()));
-        Ok(())
-    }
-
-    fn step_xen_cmdline(&self) -> Result<()> {
-        // Single source of truth lives in `grub_xen_cmdline_snippet` so
-        // post-lift `rotten-apple install` can detect drift against the
-        // SAME template and refresh without forcing a full re-lift.
-        let snippet = grub_xen_cmdline_snippet(self.dom0_mem_mb, self.dom0_vcpus);
-        let path = Path::new("/etc/default/grub.d/40-rotten-apple.cfg");
-        self.write_file("write Xen cmdline", path, &snippet)
-    }
-
-    fn step_update_grub(&self) -> Result<()> {
-        self.run("update-grub", "update-grub", &[])
-    }
-
-    fn step_verify_dual_entry(&self) -> Result<()> {
-        if self.dry_run {
-            self.step_log("verify dual-entry GRUB",
-                "would read /boot/grub/grub.cfg and assert both 'Ubuntu' \
-                 and 'Ubuntu …with Xen hypervisor' menuentries present");
-            return Ok(());
-        }
-        let cfg = std::fs::read_to_string("/boot/grub/grub.cfg")
-            .map_err(|e| LiftError::Verify(format!(
-                "could not read /boot/grub/grub.cfg: {e}")))?;
-        let has_xen = cfg.contains("with Xen hypervisor")
-                   || cfg.contains("xen.gz")
-                   || cfg.contains("multiboot2 /boot/xen");
-        let has_bare_metal = cfg.matches("menuentry 'Ubuntu").count() >= 1;
-        if !has_xen {
-            return Err(LiftError::Verify(
-                "Xen GRUB entry not present after update-grub. Did \
-                 xen-system-amd64 install correctly? Check apt log.".into()));
-        }
-        if !has_bare_metal {
-            return Err(LiftError::Verify(
-                "bare-metal Ubuntu menuentry not present in grub.cfg. \
-                 Refusing to leave the system without a recovery path.".into()));
-        }
-        self.step_log("verify dual-entry GRUB",
-            &format!("OK — Xen entry + bare-metal Ubuntu entry both \
-                      present in {} bytes of grub.cfg", cfg.len()));
-        Ok(())
-    }
-
-    // ---- helpers ----
-
-    fn run(&self, step: &'static str, prog: &str, args: &[&str]) -> Result<()> {
-        self.run_with_env(step, prog, args, &[])
-    }
-
-    fn run_with_env(
-        &self, step: &'static str, prog: &str, args: &[&str],
-        env: &[(&str, &str)],
-    ) -> Result<()> {
-        let env_prefix = env.iter()
-            .map(|(k, v)| format!("{k}={v} "))
-            .collect::<String>();
-        self.step_log(step, &format!("{env_prefix}{prog} {}", args.join(" ")));
-        if self.dry_run { return Ok(()) }
-        let mut cmd = Command::new(prog);
-        cmd.args(args);
-        for (k, v) in env { cmd.env(k, v); }
-        let out = cmd.output().map_err(|e|
-            LiftError::Command { step, detail: format!("spawn: {e}") })?;
-        if !out.status.success() {
-            return Err(LiftError::Command { step,
-                detail: format!("exit={}\nstdout: {}\nstderr: {}",
-                                out.status,
-                                String::from_utf8_lossy(&out.stdout),
-                                String::from_utf8_lossy(&out.stderr)) });
-        }
-        Ok(())
-    }
-
-    fn write_file(&self, step: &'static str, path: &Path, content: &str) -> Result<()> {
-        if self.dry_run {
-            self.step_log(step,
-                &format!("would write {} ({} bytes)", path.display(), content.len()));
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e|
-                LiftError::Command { step,
-                    detail: format!("mkdir {}: {}", parent.display(), e) })?;
-        }
-        std::fs::write(path, content).map_err(|e|
-            LiftError::Command { step,
-                detail: format!("write {}: {}", path.display(), e) })?;
-        self.step_log(step, &format!("→ {} ({} bytes)", path.display(), content.len()));
-        Ok(())
-    }
-
-    fn step_log(&self, step: &str, what: &str) {
-        eprintln!("    [{step}] {what}");
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 
 #[cfg(test)]
@@ -664,66 +458,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lift_plan_for_this_host_does_not_panic() {
-        let manifest = tempfile::NamedTempFile::new().unwrap();
-        let bin = tempfile::NamedTempFile::new().unwrap();
-        let _ = LiftPlan::for_this_host(
-            manifest.path().to_path_buf(),
-            bin.path().to_path_buf(),
-            true);
-    }
-
-    #[test]
-    fn lift_plan_carries_planner_dom0_size() {
-        let manifest = tempfile::NamedTempFile::new().unwrap();
-        let bin = tempfile::NamedTempFile::new().unwrap();
-        let p = LiftPlan::for_this_host(
-            manifest.path().to_path_buf(),
-            bin.path().to_path_buf(),
-            true).unwrap();
-        // Sanity bounds; specific value depends on host RAM. Planner clamps
-        // to [768, 4096].
-        assert!(p.dom0_mem_mb >= 768);
-        assert!(p.dom0_mem_mb <= 4096);
-        assert!(p.dom0_vcpus >= 1);
-        assert!(p.dom0_vcpus <= 4);
-    }
-
-    #[test]
     fn grub_snippet_is_self_describing_round_trip() {
-        // The drift detector parses dom0_mem and dom0_max_vcpus out of a
-        // file produced by grub_xen_cmdline_snippet. If those two
-        // functions disagree, install would always think the snippet is
-        // drifted and re-run update-grub on every install — mostly
-        // harmless but noisy. Pin them.
-        let s = grub_xen_cmdline_snippet(2048, 4);
-        let (mem, vcpus) = parse_dom0_sizing_from_grub_snippet(&s).unwrap();
+        // The drift detector parses dom0_mem, max:, and dom0_max_vcpus out
+        // of a file produced by grub_xen_cmdline_snippet. If they disagree,
+        // install would always think the snippet is drifted and re-run
+        // update-grub on every install — mostly harmless but noisy. Pin them.
+        let s = grub_xen_cmdline_snippet(2048, 8192, 4);
+        let (mem, mem_max, vcpus) = parse_dom0_sizing_from_grub_snippet(&s).unwrap();
         assert_eq!(mem, 2048);
+        assert_eq!(mem_max, 8192);
         assert_eq!(vcpus, 4);
     }
 
     #[test]
-    fn grub_snippet_drops_console_hvc0() {
-        // Encrypted-disk-then-black-screen regression: hvc0 hijacks
-        // /dev/console from the framebuffer. Ensure the template stays
-        // free of it.
-        let s = grub_xen_cmdline_snippet(1856, 4);
-        assert!(!s.contains("console=hvc0"),
-            "GRUB snippet must not include console=hvc0; that hides post-LUKS visuals");
-        assert!(s.contains("console=tty0"),
-            "GRUB snippet must keep console=tty0 for the framebuffer");
+    fn grub_snippet_supports_live_expansion_max_above_start() {
+        // The whole point of having a separate `max:` is that dom0 can
+        // start small and balloon up at runtime. Ensure max != start
+        // round-trips correctly through the formatter.
+        let s = grub_xen_cmdline_snippet(4096, 32768, 20);
+        assert!(s.contains("dom0_mem=4096M,max:32768M"),
+            "snippet must allow max > start for live expansion: {s}");
     }
 
     #[test]
-    fn grub_snippet_drops_splash_for_visible_luks_prompt() {
-        // Under Xen, plymouth's graphical splash claims the framebuffer at
-        // boot and the LUKS passphrase prompt renders invisibly behind it.
-        // Without `splash`, cryptsetup-initramfs falls through to text-mode
-        // askpass on /dev/console (= tty0) which is visible.
-        // We assert against just the cmdline value (between the quotes),
-        // since the surrounding comments legitimately use the word
-        // "splash" to document history.
-        let s = grub_xen_cmdline_snippet(1856, 4);
+    fn grub_drift_parser_accepts_g_suffix() {
+        // Operators (and our docs) use `4G` more often than `4096M`.
+        // Both must round-trip through the parser.
+        let s = "GRUB_CMDLINE_XEN_DEFAULT=\"dom0_mem=4G,max:32G dom0_max_vcpus=20 dom0_vcpus_pin\"\n";
+        let (mem, mem_max, vcpus) = parse_dom0_sizing_from_grub_snippet(s).unwrap();
+        assert_eq!(mem, 4096);
+        assert_eq!(mem_max, 32768);
+        assert_eq!(vcpus, 20);
+    }
+
+    #[test]
+    fn grub_snippet_drops_console_hvc0() {
+        // Black-screen regression: under this Xen 4.20 build, listing hvc0
+        // on the dom0 cmdline has caused boot deadlocks. Stay tty0-only.
+        // Check just the quoted cmdline value — comments legitimately
+        // mention `hvc0` to document why we avoid it.
+        let s = grub_xen_cmdline_snippet(1856, 1856, 4);
+        let cmdline_value = s
+            .lines()
+            .find(|l| l.starts_with("GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="))
+            .expect("snippet must define cmdline line")
+            .split('"').nth(1).expect("quoted value");
+        assert!(!cmdline_value.contains("console=hvc0"),
+            "dom0 cmdline must not include console=hvc0: {cmdline_value:?}");
+        assert!(cmdline_value.contains("console=tty0"),
+            "dom0 cmdline must keep console=tty0: {cmdline_value:?}");
+    }
+
+    #[test]
+    fn grub_snippet_drops_splash_keeps_text_plymouth() {
+        // Pre-TPM2 history: under Xen, plymouth's graphical splash claimed
+        // the framebuffer and hid the LUKS passphrase prompt. Splash stays
+        // out as belt-and-braces; TPM2 auto-unlock is the actual fix for
+        // LUKS visibility (see /etc/crypttab `tpm2-device=auto`).
+        let s = grub_xen_cmdline_snippet(1856, 1856, 4);
         let cmdline_value = s
             .lines()
             .find(|l| l.starts_with("GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="))
@@ -732,7 +524,7 @@ mod tests {
             .nth(1)
             .expect("cmdline value should be quoted");
         assert!(!cmdline_value.contains("splash"),
-            "Xen cmdline must NOT contain `splash` (hides LUKS under Xen): {cmdline_value:?}");
+            "Xen cmdline must NOT contain `splash`: {cmdline_value:?}");
         assert!(cmdline_value.contains("plymouth.use-mode=text"),
             "Xen cmdline must keep plymouth.use-mode=text as belt-and-braces: {cmdline_value:?}");
         assert!(cmdline_value.contains("quiet"),
@@ -742,19 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn grub_snippet_includes_iommu_flags_for_passthrough() {
-        // Without these the dom0 kernel doesn't populate
-        // /sys/kernel/iommu_groups; GPU detection then has no choice but
-        // to mark every non-framebuffer GPU as Locked(IommuOff), and the
-        // dGPU passthrough path is unreachable.
-        let s = grub_xen_cmdline_snippet(1856, 4);
+    fn grub_snippet_uses_iommu_pt_not_force_on() {
+        // Bare-metal Ubuntu boots cleanly with `iommu=pt`. Under Xen PV,
+        // `iommu=on` (force-on) caused dom0 to attempt IOMMU mappings that
+        // conflict with Xen's `no-igfx` setting and the framebuffer never
+        // came up (2026-05-08). `iommu=pt` keeps /sys/kernel/iommu_groups
+        // populated for dGPU passthrough detection without forcing
+        // translation on the iGPU.
+        let s = grub_xen_cmdline_snippet(1856, 1856, 4);
         let cmdline_value = s
             .lines()
             .find(|l| l.starts_with("GRUB_CMDLINE_LINUX_XEN_REPLACE_DEFAULT="))
             .expect("snippet must define cmdline line")
             .split('"').nth(1).expect("quoted value");
-        assert!(cmdline_value.contains("iommu=on"),
-            "Xen cmdline must include iommu=on: {cmdline_value:?}");
+        // Token-exact check: `iommu=on` as its own whitespace-delimited
+        // token. Substring would false-positive on `intel_iommu=on` and
+        // `amd_iommu=on` which we keep as belt-and-braces.
+        let tokens: Vec<&str> = cmdline_value.split_whitespace().collect();
+        assert!(tokens.contains(&"iommu=pt"),
+            "dom0 Linux cmdline must use iommu=pt: {cmdline_value:?}");
+        assert!(!tokens.contains(&"iommu=on"),
+            "dom0 Linux cmdline must not use iommu=on: {cmdline_value:?}");
         // Vendor-specific flags are belt-and-braces; harmless on the
         // wrong CPU because the kernel ignores the one that doesn't apply.
         assert!(cmdline_value.contains("intel_iommu=on"),
@@ -767,7 +567,7 @@ mod tests {
     fn grub_snippet_includes_iommu_no_igfx() {
         // Intel iGPU mode-switch under Xen IOMMU is fragile. Pin the
         // workaround in the template.
-        let s = grub_xen_cmdline_snippet(1856, 4);
+        let s = grub_xen_cmdline_snippet(1856, 1856, 4);
         assert!(s.contains("iommu=verbose,no-igfx"),
             "GRUB snippet must keep iommu=verbose,no-igfx");
     }
@@ -778,6 +578,14 @@ mod tests {
         // refresh_xen_cmdline_if_present leaves the file alone instead
         // of clobbering whatever the operator put there.
         let s = "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash\"\n";
+        assert!(parse_dom0_sizing_from_grub_snippet(s).is_none());
+    }
+
+    #[test]
+    fn grub_drift_parser_returns_none_on_missing_max_field() {
+        // Old-shape (pre-2026-05-08) snippets without `,max:` no longer
+        // parse — install leaves them alone rather than guessing the max.
+        let s = "GRUB_CMDLINE_XEN_DEFAULT=\"dom0_mem=2048M dom0_max_vcpus=4 dom0_vcpus_pin\"\n";
         assert!(parse_dom0_sizing_from_grub_snippet(s).is_none());
     }
 

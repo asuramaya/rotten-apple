@@ -29,6 +29,7 @@
 //! The user_root_uuid is read from /proc/cmdline at boot — that's how
 //! /init knows which device to share with the user-desktop guest.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::thin_dom0_manifest::{
@@ -234,16 +235,32 @@ dump_xen_logs() {
 # nothing matches, callers fall back to /tmp-only logging.
 mount_host_boot() {
     mkdir -p /boot-host
-    for dev in /dev/nvme*n*p* /dev/sd*[0-9]* /dev/mmcblk*p* /dev/vd*[0-9]* /dev/xvd*[0-9]*; do
-        [ -b "$dev" ] || continue
-        if mount -t ext4 -o ro "$dev" /boot-host 2>/dev/null; then
-            if [ -f /boot-host/rotten-apple/vmlinuz ] || \
-               [ -f /boot-host/boot/rotten-apple/vmlinuz ]; then
-                mount -o remount,rw /boot-host 2>/dev/null
-                return 0
+    # NVMe namespaces can take several SECONDS to enumerate after
+    # `modprobe nvme` on real hardware — the sim's virtio scratch disk is
+    # instant, which masked this for the whole project. A single scan that
+    # runs before /dev/nvme0n1p* exists finds nothing, returns 1, and the
+    # persistent log is NEVER created — dom0 then boots blind with no
+    # forensic trail. CONFIRMED-SHAPE 2026-06-15: both ThinDom0 entries
+    # HALTED at black (no reboot → dom0 did NOT crash, so unpack succeeded)
+    # yet left NO new init log → /init ran but mount_host_boot didn't
+    # succeed. So: poll for the boot device for ~20s, and `timeout`-wrap
+    # each mount so a slow/half-enumerated device can't WEDGE PID 1 here
+    # (a hang would also starve the GPU coldplug below → panel stays dark).
+    _wait=0
+    while [ "$_wait" -lt 20 ]; do
+        for dev in /dev/nvme*n*p* /dev/sd*[0-9]* /dev/mmcblk*p* /dev/vd*[0-9]* /dev/xvd*[0-9]*; do
+            [ -b "$dev" ] || continue
+            if timeout 5 mount -t ext4 -o ro "$dev" /boot-host 2>/dev/null; then
+                if [ -f /boot-host/rotten-apple/vmlinuz ] || \
+                   [ -f /boot-host/boot/rotten-apple/vmlinuz ]; then
+                    mount -o remount,rw /boot-host 2>/dev/null
+                    return 0
+                fi
+                umount /boot-host 2>/dev/null
             fi
-            umount /boot-host 2>/dev/null
-        fi
+        done
+        _wait=$((_wait + 1))
+        sleep 1
     done
     return 1
 }
@@ -750,6 +767,160 @@ fn bundle_gpu_firmware(spec: &RootfsSpec) -> Result<(), RootfsError> {
     Ok(())
 }
 
+/// The kernel modules a ThinDom0 actually loads — the seeds whose full
+/// dependency closure (and ONLY that closure) we bundle into the cpio,
+/// instead of the entire ~190 MiB `/lib/modules/<kver>/kernel` tree. The
+/// detected framebuffer GPU driver (e.g. i915/amdgpu) is appended at
+/// runtime from `RootfsSpec::framebuffer_gpu_driver`.
+///
+/// Why each: storage (mount the host /boot for logs + see guest disks);
+/// ext4 (mount_host_boot does `mount -t ext4`); the xen_* control-plane
+/// set (xenstored needs gntdev/evtchn, guests need blk/netback, passthrough
+/// needs pciback — see render_init_script); bridge (xenbr0); xhci (USB/dock
+/// NIC enumeration); a spread of wired + USB-ethernet NIC drivers so a dock
+/// or dongle brings up dom0's SSH escape hatch; virtio_* so the QEMU
+/// bring-up harness ([[project_thindom0_qemu_simulator]]) still works.
+/// Anything not in a seed's dep chain is simply absent — modprobe of an
+/// unmatched modalias in /init fails gracefully (it's wrapped in `try`).
+const DOM0_SEED_MODULES: &[&str] = &[
+    // storage + root fs
+    "nvme", "nvme_core", "sd_mod", "ext4",
+    // xen control plane + PV backends + passthrough (must match /init)
+    "xen_blkback", "xen_netback", "xenfs",
+    "xen_gntdev", "xen_gntalloc", "xen_evtchn", "xen_pciback",
+    // networking: bridge for xenbr0, AF_PACKET for dhclient
+    "bridge", "af_packet",
+    // USB host controllers (dock / USB-NIC enumeration)
+    "xhci_pci", "xhci_hcd",
+    // wired NICs (common Intel/Realtek laptop + dock)
+    "e1000e", "igc", "igb", "r8169",
+    // USB-ethernet (dock dongles)
+    "r8152", "cdc_ether", "usbnet", "asix", "ax88179_178a",
+    // virtio (QEMU sim scratch disk + net)
+    "virtio_pci", "virtio_blk", "virtio_scsi", "virtio_net",
+];
+
+/// Parse `modprobe --show-depends` for `module` under `kver` into the set of
+/// absolute `.ko[.zst]` host paths it needs (the module itself + every
+/// dependency, in load order). Returns empty for builtin/unknown/missing
+/// modules (modprobe errors or emits only `builtin` lines) — the caller
+/// tolerates that, since the seed list is deliberately broad.
+fn module_dep_files(module: &str, kver: &str) -> Vec<PathBuf> {
+    use std::process::Command;
+    let out = Command::new("modprobe")
+        .arg("--show-depends")
+        .arg("--set-version").arg(kver)
+        .arg(module)
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        // lines look like: `insmod /lib/modules/<kver>/kernel/.../foo.ko.zst`
+        .filter_map(|l| l.strip_prefix("insmod "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Bundle ONLY the modules a thin dom0 needs (the closure of
+/// `DOM0_SEED_MODULES` + the detected GPU driver) into the cpio, then
+/// regenerate modules.dep/alias against that slimmed set with `depmod -b`.
+///
+/// Replaces a wholesale `cp -a /lib/modules/<kver>` (~190 MiB) — which made
+/// the cpio 264 MiB compressed / 461 MiB unpacked. That fat initrd was the
+/// common root of two boot failures: dom0_mem unpack OOM, and GRUB's ext4
+/// driver stalling for minutes on a >4-extent initrd (a 264 MiB file can't
+/// hold fewer than ~3 extents and re-fragments on every write). A ~30-50
+/// MiB slim initrd is a single extent, loads instantly, and unpacks in
+/// well under 1 GiB. See [[project_thindom0_boot_wedge]].
+fn bundle_kernel_modules(spec: &RootfsSpec) -> Result<(), RootfsError> {
+    use std::process::Command;
+    let log = |msg: String| eprintln!("    [rootfs/modules] {msg}");
+    let kver = &spec.kernel_release;
+    let host_modules = PathBuf::from(format!("/lib/modules/{kver}"));
+    if !host_modules.exists() {
+        return Err(RootfsError::PreFlight(format!(
+            "host has no /lib/modules/{kver} — kernel-modules package missing or \
+             wrong release; without it dom0 can't see NVMe/SCSI storage")));
+    }
+
+    let mut seeds: Vec<String> = DOM0_SEED_MODULES.iter().map(|s| s.to_string()).collect();
+    if let Some(drv) = &spec.framebuffer_gpu_driver {
+        seeds.push(drv.clone());
+    }
+
+    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    for m in &seeds {
+        for f in module_dep_files(m, kver) {
+            files.insert(f);
+        }
+    }
+    // Sanity floor: if dependency resolution produced almost nothing, the
+    // host tooling (modprobe/modules.dep) is broken — fail loudly rather
+    // than ship a cpio with no storage drivers (silent unbootable dom0).
+    if files.len() < 5 {
+        return Err(RootfsError::PreFlight(format!(
+            "kernel-module dependency resolution yielded only {} files for {kver}; \
+             expected dozens. Is modules.dep present (run depmod)? Refusing to \
+             build a cpio with no storage/xen drivers.", files.len())));
+    }
+
+    let dst_modules = spec.workdir.join(format!("lib/modules/{kver}"));
+    std::fs::create_dir_all(&dst_modules).map_err(|e| RootfsError::Step {
+        step: "mkdir /lib/modules/<kver>", detail: e.to_string(),
+    })?;
+
+    // Copy each resolved .ko preserving its path under the workdir. `cp -a
+    // --parents <abs> <workdir>` recreates <workdir>/lib/modules/<kver>/...
+    let mut cp = Command::new("cp");
+    cp.arg("-a").arg("--parents");
+    for f in &files {
+        cp.arg(f);
+    }
+    cp.arg(&spec.workdir);
+    let cp_out = cp.output().map_err(|e| RootfsError::Step {
+        step: "cp -a --parents <modules>", detail: e.to_string(),
+    })?;
+    if !cp_out.status.success() {
+        return Err(RootfsError::Step {
+            step: "cp -a --parents <modules>",
+            detail: format!("exit={}\nstderr: {}",
+                cp_out.status, String::from_utf8_lossy(&cp_out.stderr)),
+        });
+    }
+
+    // depmod needs the builtin/order metadata to resolve builtin symbols;
+    // copy it best-effort (absent on some kernels), then regenerate
+    // modules.dep + modules.alias from JUST the .ko files we copied so
+    // modprobe and the /init modalias coldplug stay consistent.
+    for meta in ["modules.builtin", "modules.builtin.modinfo", "modules.order"] {
+        let p = host_modules.join(meta);
+        if p.exists() {
+            let _ = Command::new("cp").arg("-a").arg("--parents").arg(&p)
+                .arg(&spec.workdir).output();
+        }
+    }
+    let depmod = Command::new("depmod")
+        .arg("-b").arg(&spec.workdir).arg(kver)
+        .output()
+        .map_err(|e| RootfsError::Step { step: "depmod -b", detail: e.to_string() })?;
+    if !depmod.status.success() {
+        return Err(RootfsError::Step {
+            step: "depmod -b",
+            detail: format!("exit={}\nstderr: {}",
+                depmod.status, String::from_utf8_lossy(&depmod.stderr)),
+        });
+    }
+
+    log(format!(
+        "→ /lib/modules/{kver} (slim: {} .ko from {} seeds, vs whole-tree ~190 MiB)",
+        files.len(), seeds.len()));
+    Ok(())
+}
+
 pub fn build_rootfs(spec: &RootfsSpec, dry_run: bool) -> Result<PathBuf, RootfsError> {
     use std::process::Command;
 
@@ -821,41 +992,12 @@ pub fn build_rootfs(spec: &RootfsSpec, dry_run: bool) -> Result<PathBuf, RootfsE
         });
     }
 
-    // 2.5. Copy host's /lib/modules/<release> into the cpio. Without
-    // this, dom0 has zero loadable kernel modules and can't see NVMe
-    // (CONFIG_BLK_DEV_NVME=m on Ubuntu), can't load i915 for visible
-    // console (=m), can't bring up xen_blkback for guest disks (=m).
-    // We use `cp -a` so symlinks, perms, and mtimes are preserved
-    // (modprobe verifies modules.dep checksums via mtime). Adds ~150-
-    // 250 MB to the cpio uncompressed, ~100-150 MB compressed; fine
-    // for a 1024 MB dom0.
-    let host_modules = PathBuf::from(format!("/lib/modules/{}", spec.kernel_release));
-    if !host_modules.exists() {
-        return Err(RootfsError::PreFlight(format!(
-            "host has no /lib/modules/{} — kernel-modules package missing or \
-             wrong release; without it dom0 can't see NVMe/SCSI storage",
-            spec.kernel_release)));
-    }
-    let dst_modules_parent = spec.workdir.join("lib/modules");
-    std::fs::create_dir_all(&dst_modules_parent).map_err(|e| RootfsError::Step {
-        step: "mkdir /lib/modules", detail: e.to_string(),
-    })?;
-    let cp_modules = Command::new("cp")
-        .arg("-a")
-        .arg(&host_modules)
-        .arg(&dst_modules_parent)
-        .output()
-        .map_err(|e| RootfsError::Step {
-            step: "cp -a /lib/modules", detail: e.to_string(),
-        })?;
-    if !cp_modules.status.success() {
-        return Err(RootfsError::Step {
-            step: "cp -a /lib/modules",
-            detail: format!("exit={}\nstderr: {}",
-                cp_modules.status, String::from_utf8_lossy(&cp_modules.stderr)),
-        });
-    }
-    log("modules", format!("→ /lib/modules/{} (host kernel)", spec.kernel_release));
+    // 2.5. Bundle ONLY the kernel modules a thin dom0 needs (the closure of
+    // DOM0_SEED_MODULES + the detected GPU driver), not the whole ~190 MiB
+    // /lib/modules/<kver>/kernel tree. The fat tree made the cpio 264 MiB /
+    // 461 MiB unpacked, which caused both the dom0_mem unpack OOM and GRUB's
+    // >4-extent ext4 load stall. See bundle_kernel_modules + boot_wedge memory.
+    bundle_kernel_modules(spec)?;
 
     // 2.6. Bundle the firmware the framebuffer GPU's driver needs — derived
     // from the machine being provisioned, NOT a hardcoded vendor matrix. The

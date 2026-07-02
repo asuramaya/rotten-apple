@@ -931,6 +931,21 @@ fn stable_disk_path_for(canonical: &Path) -> PathBuf {
 }
 
 fn uname_release() -> Result<String> {
+    // Kernel PIN override. The dom0 kernel normally tracks the host's running
+    // kernel (uname -r), but that's NOT guaranteed to boot as a Xen PV dom0:
+    // the host's newest kernel can regress PV-dom0 support on a given machine.
+    // CONFIRMED on this Dell (2026-06): 6.17.0-23 reached /init and logged
+    // (init-20260522-000049.log); every 7.0.0-x boot since died BEFORE /init
+    // (no log, black) — the lift silently switched dom0 to 7.0 when the host
+    // kernel updated. `RA_DOM0_KERNEL=<release>` pins the dom0 kernel (and its
+    // module set) to a known-good PV release, decoupled from uname -r.
+    // See [[project_thindom0_boot_wedge]] / [[feedback_xen_pv_vs_pvh_dom0]].
+    if let Ok(k) = std::env::var("RA_DOM0_KERNEL") {
+        let k = k.trim();
+        if !k.is_empty() {
+            return Ok(k.to_string());
+        }
+    }
     let out = std::process::Command::new("uname").arg("-r").output()
         .map_err(|e| ThinDom0Error::PreFlight(format!("spawn uname -r: {e}")))?;
     if !out.status.success() {

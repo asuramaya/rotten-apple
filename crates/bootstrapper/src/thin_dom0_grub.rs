@@ -181,19 +181,32 @@ menuentry '{entry_name}' --class xen --class gnu-linux --class gnu --class os --
 }}
 
 # rotten-apple ThinDom0 (recovery, no autostart) — same kernel + cpio,
-# but with FULL diagnostic flags so we can see kernel output if dom0
-# hangs, and rotten_apple.no_autostart=1 so cockpit reads /proc/cmdline
-# and skips the iGPU passthrough auto-launch (keeps the screen with
-# dom0). Use for the FIRST boot of any new cmdline shape.
+# but MAXIMALLY OBSERVABLE so we can actually SEE where dom0 dies:
+#   * set gfxpayload=keep  — hand GRUB's live framebuffer to Xen so Xen's
+#     console=vga is visible (without this, Xen draws to a dead fb and the
+#     last thing on screen is GRUB's "Loading dom0 rootfs"; 2026-06-15 the
+#     lift had wiped a manual gfxpayload edit, re-blinding us).
+#   * dom0 console=hvc0 earlyprintk=xen — route the dom0 KERNEL's console
+#     through Xen's PV console (the visible vga one) instead of grabbing
+#     the framebuffer directly with tty0 (which goes black under Xen PV
+#     before i915 loads). This is what lets dom0's unpack/init/mount
+#     messages reach a screen we can read.
+#   * Xen noreboot — HALT on a dom0/Xen panic so the crash text freezes
+#     on screen instead of resetting the machine and erasing the evidence.
+#   * rotten_apple.no_autostart=1 — cockpit skips the iGPU passthrough
+#     auto-launch (keeps the screen with dom0).
+# Use for the FIRST boot of any new cmdline shape. The normal entry keeps
+# console=tty0 (the real panel path) — this entry is the diagnostic lens.
 menuentry '{entry_name} (recovery, no autostart)' --class xen --class gnu-linux --class gnu --class os --class rotten-apple-recovery {{
     insmod gzio
     insmod part_gpt
     insmod ext2
     search --no-floppy --fs-uuid --set=root {boot_fs_uuid}
     echo 'Loading Xen (recovery) ...'
-    multiboot2 {xen} placeholder dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} iommu=verbose,no-igfx console=vga sync_console=true loglvl=all guest_loglvl=all
+    set gfxpayload=keep
+    multiboot2 {xen} placeholder dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} iommu=verbose,no-igfx console=vga sync_console=true loglvl=all guest_loglvl=all noreboot
     echo 'Loading dom0 kernel (recovery) ...'
-    module2 {kernel} placeholder console=tty0 loglevel=7 iommu=pt intel_iommu=on amd_iommu=on rotten_apple.user_root_uuid={user_root_uuid}{pin_arg}{pciback_hide_arg} rotten_apple.no_autostart=1
+    module2 {kernel} placeholder console=hvc0 earlyprintk=xen loglevel=7 iommu=pt intel_iommu=on amd_iommu=on rotten_apple.user_root_uuid={user_root_uuid}{pin_arg}{pciback_hide_arg} rotten_apple.no_autostart=1
     echo 'Loading dom0 rootfs (initrd) ...'
     module2 {initrd}
 }}

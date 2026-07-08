@@ -291,6 +291,8 @@ mod tests {
             boot_fs_uuid: "2048f8be-403d-4cb7-b79a-c821a0daa609".to_string(),
             xen_image_basename: PathBuf::from("xen-4.20-amd64.gz"),
             framebuffer_gpu_bdf: Some("0000:00:02.0".to_string()),
+            esp_device: Some(PathBuf::from("/dev/nvme0n1p1")),
+            esp_fs_uuid: Some("B6D5-2FF2".to_string()),
             dry_run: true,
         }
     }

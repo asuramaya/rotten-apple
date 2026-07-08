@@ -77,6 +77,70 @@ pub struct GrubEntryInputs {
     /// from i915 and black the screen). Only `PassthroughIfAvailable` emits
     /// the hide hint, to lease the GPU to the guest.
     pub display_mode: UserDesktopDisplayMode,
+    /// UUID of the EFI System Partition's filesystem (vfat serial like
+    /// "B6D5-2FF2") when the host is UEFI AND xen-*.efi was staged to
+    /// /boot/efi/EFI/xen/. When present, the PRIMARY and RECOVERY
+    /// entries chainload xen.efi (Xen's native EFI entry point) instead
+    /// of multiboot2 — GRUB 2.14 release has a confirmed relocator #PF
+    /// at the multiboot2 handoff on x86_64 EFI (upstream patches
+    /// grub-devel 2026-05-13, unmerged; see msg43110/43111), so on any
+    /// current GRUB the multiboot2 path dies BEFORE Xen executes one
+    /// instruction. Chainloading goes through firmware LoadImage/
+    /// StartImage — no GRUB relocator involved. None on BIOS hosts (no
+    /// ESP): multiboot2 entries are emitted as before (BIOS GRUB does
+    /// not use the broken EFI relocator path).
+    pub esp_fs_uuid: Option<String>,
+}
+
+/// Xen hypervisor cmdline, shared verbatim between the multiboot2 GRUB
+/// entries and the xen.cfg `options=` line on the ESP — one builder so
+/// the two boot paths cannot drift apart.
+pub(crate) fn xen_options_cmdline(g: &GrubEntryInputs, recovery: bool) -> String {
+    let GrubEntryInputs { dom0_mem_mb, dom0_vcpus, .. } = g;
+    let mut s = format!(
+        "dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} \
+         iommu=verbose,no-igfx console=vga");
+    if recovery {
+        s.push_str(" sync_console=true");
+    }
+    s.push_str(" loglvl=all guest_loglvl=all");
+    if recovery {
+        s.push_str(" noreboot");
+    }
+    s
+}
+
+/// dom0 kernel cmdline (everything after the kernel path), shared
+/// between the multiboot2 GRUB entries and xen.cfg's `kernel=` line.
+///
+/// PCI passthrough hint: we deliberately do NOT use
+/// `xen-pciback.hide=(BDF)` (the kernel-blessed cmdline syntax) because
+/// the parentheses get interpreted as shell metacharacters by the
+/// initramfs/init shell parser, panicking PID 1 with "syntax error
+/// unexpected '('" → kernel reboot → bootloop (real failure 2026-05-07).
+/// Instead we pass our OWN parens-free param; /init does the sysfs bind
+/// (`new_slot` + `bind`) after modprobe xen_pciback. And only in
+/// passthrough mode — in ParavirtOnly (production default) dom0 keeps
+/// the framebuffer GPU so cockpit is visible on the panel; emitting
+/// hide_pci would unbind i915 and black the screen.
+pub(crate) fn dom0_kernel_cmdline(g: &GrubEntryInputs, recovery: bool) -> String {
+    let GrubEntryInputs {
+        user_root_uuid, dom0_pinned_cpu, framebuffer_gpu_bdf, display_mode, ..
+    } = g;
+    let pin_arg = match dom0_pinned_cpu {
+        Some(cpu) => format!(" rotten_apple.dom0_pinned_cpu={cpu}"),
+        None => String::new(),
+    };
+    let pciback_hide_arg = match (display_mode, framebuffer_gpu_bdf) {
+        (UserDesktopDisplayMode::PassthroughIfAvailable, Some(bdf)) =>
+            format!(" rotten_apple.hide_pci={bdf}"),
+        _ => String::new(),
+    };
+    let console = if recovery { "console=hvc0 earlyprintk=xen" } else { "console=tty0" };
+    let no_autostart = if recovery { " rotten_apple.no_autostart=1" } else { "" };
+    format!(
+        "{console} loglevel=7 iommu=pt intel_iommu=on amd_iommu=on \
+         rotten_apple.user_root_uuid={user_root_uuid}{pin_arg}{pciback_hide_arg}{no_autostart}")
 }
 
 /// Render the executable shell script that GRUB's update-grub will
@@ -89,34 +153,15 @@ pub fn render_grub_script(g: &GrubEntryInputs) -> String {
     let kernel = path_with_leading_slash(&g.dom0_kernel);
     let initrd = path_with_leading_slash(&g.dom0_initrd);
 
-    let GrubEntryInputs {
-        entry_name, boot_fs_uuid, dom0_mem_mb, dom0_vcpus, user_root_uuid,
-        dom0_pinned_cpu, framebuffer_gpu_bdf, display_mode, ..
-    } = g;
-    let pin_arg = match dom0_pinned_cpu {
-        Some(cpu) => format!(" rotten_apple.dom0_pinned_cpu={cpu}"),
-        None => String::new(),
-    };
-    // PCI passthrough hint for the framebuffer GPU. We deliberately do
-    // NOT use `xen-pciback.hide=(BDF)` (the kernel-blessed cmdline
-    // syntax) because the parentheses get interpreted as shell
-    // metacharacters by the initramfs/init shell parser, panicking
-    // PID 1 with "syntax error unexpected '('" → kernel reboot →
-    // bootloop. This is well-documented across Alpine/Arch/Debian
-    // forums (search 2026-05-07). Instead we pass our OWN cmdline
-    // hint without parens; /init parses it and does the sysfs bind
-    // (`/sys/bus/pci/drivers/pciback/new_slot` + `bind`) at runtime
-    // after modprobe xen_pciback. Same end state (device assignable
-    // before guest start), no shell-injection landmine.
-    // Only lease the GPU to the guest in passthrough mode. In ParavirtOnly
-    // (production default) dom0 keeps the framebuffer GPU so cockpit is
-    // visible on the panel — emitting hide_pci here would bind it to
-    // xen-pciback, unbind i915, and black the screen.
-    let pciback_hide_arg = match (display_mode, framebuffer_gpu_bdf) {
-        (UserDesktopDisplayMode::PassthroughIfAvailable, Some(bdf)) =>
-            format!(" rotten_apple.hide_pci={bdf}"),
-        _ => String::new(),
-    };
+    let GrubEntryInputs { entry_name, boot_fs_uuid, .. } = g;
+    // Cmdlines come from the shared builders (the SAME builders feed
+    // xen.cfg on the ESP — see thin_dom0_efi::render_xen_cfg) so the
+    // chainload and multiboot2 boot paths cannot drift apart. The
+    // pciback-hide / pin-hint rationale lives on the builders.
+    let xen_opts           = xen_options_cmdline(g, false);
+    let xen_opts_recovery  = xen_options_cmdline(g, true);
+    let dom0_args          = dom0_kernel_cmdline(g, false);
+    let dom0_args_recovery = dom0_kernel_cmdline(g, true);
 
     // Two menuentries land:
     //   1. <entry_name>                            — normal path, autostart enabled.
@@ -155,6 +200,73 @@ pub fn render_grub_script(g: &GrubEntryInputs) -> String {
     // it tries to execute them as commands and fails update-grub with
     // "syntax error". Explanatory comments live ABOVE the menuentry
     // block (top-level GRUB scope, where `#` is a real comment) only.
+    //
+    // UEFI hosts (esp_fs_uuid present): primary + recovery CHAINLOAD
+    // xen.efi from the ESP. GRUB 2.14 release page-faults in its own
+    // relocator at the multiboot2→Xen handoff on x86_64 EFI (confirmed
+    // on this Dell 2026-07-08: identical silent death on Xen 4.20.0 AND
+    // 4.20.2; upstream fix patches grub-devel 2026-05-13 unmerged), so
+    // multiboot2 survives only as a labeled fallback entry for when a
+    // fixed GRUB ships. Chainloading uses firmware LoadImage/StartImage
+    // — no GRUB relocator anywhere in the path. The Xen/dom0 cmdlines
+    // for the chainload path live in /EFI/xen/xen.cfg (same builders);
+    // the section argument after xen.efi picks normal vs recovery.
+    if let Some(esp_uuid) = &g.esp_fs_uuid {
+        return format!(r#"#!/bin/sh
+# Generated by rotten-apple bootstrapper. Do not edit by hand — re-run
+# `sudo rotten-apple lift` to regenerate.
+#
+# This script appends 'rotten-apple ThinDom0' menuentries to grub.cfg.
+# It runs AFTER /etc/grub.d/10_linux (which produces the sacred
+# bare-metal Ubuntu entry) so the user can always pick stock Ubuntu.
+exec tail -n +13 $0
+# ---- everything below this line is what update-grub captures --------
+
+# rotten-apple ThinDom0 — primary entry, autostart enabled. Chainloads
+# Xen's native EFI image; cmdlines live in /EFI/xen/xen.cfg on the ESP.
+menuentry '{entry_name}' --class xen --class gnu-linux --class gnu --class os --class rotten-apple {{
+    insmod part_gpt
+    insmod fat
+    insmod chain
+    search --no-floppy --fs-uuid --set=root {esp_uuid}
+    echo 'Chainloading Xen native EFI (xen.efi, section: thindom0) ...'
+    chainloader /EFI/xen/xen.efi thindom0
+}}
+
+# rotten-apple ThinDom0 (recovery, no autostart) — same xen.efi, but the
+# 'recovery' xen.cfg section: Xen sync_console + noreboot (crash text
+# stays on screen), dom0 console=hvc0 (visible through Xen's console),
+# rotten_apple.no_autostart=1 (cockpit keeps the screen). Use for the
+# FIRST boot of any new artifact shape.
+menuentry '{entry_name} (recovery, no autostart)' --class xen --class gnu-linux --class gnu --class os --class rotten-apple-recovery {{
+    insmod part_gpt
+    insmod fat
+    insmod chain
+    search --no-floppy --fs-uuid --set=root {esp_uuid}
+    echo 'Chainloading Xen native EFI (xen.efi, section: recovery) ...'
+    chainloader /EFI/xen/xen.efi recovery
+}}
+
+# rotten-apple ThinDom0 (multiboot2 fallback) — the classic GRUB-native
+# Xen boot. BROKEN on GRUB 2.14 EFI (relocator #PF before Xen runs, all
+# echo lines print then the machine freezes silently). Kept so the day a
+# fixed GRUB ships this path can be re-validated without a re-lift.
+# Recovery-flavored flags: this entry only gets used for bring-up.
+menuentry '{entry_name} (multiboot2 fallback -- broken on GRUB 2.14 EFI)' --class xen --class rotten-apple-fallback {{
+    insmod gzio
+    insmod part_gpt
+    insmod ext2
+    search --no-floppy --fs-uuid --set=root {boot_fs_uuid}
+    echo 'Loading Xen via multiboot2 (KNOWN BROKEN on GRUB 2.14 EFI) ...'
+    set gfxpayload=keep
+    multiboot2 {xen} placeholder {xen_opts_recovery}
+    echo 'Loading dom0 kernel ...'
+    module2 {kernel} placeholder {dom0_args_recovery}
+    echo 'Loading dom0 rootfs (initrd) ...'
+    module2 {initrd}
+}}
+"#);
+    }
     format!(r#"#!/bin/sh
 # Generated by rotten-apple bootstrapper. Do not edit by hand — re-run
 # `sudo rotten-apple lift` to regenerate.
@@ -173,9 +285,9 @@ menuentry '{entry_name}' --class xen --class gnu-linux --class gnu --class os --
     insmod ext2
     search --no-floppy --fs-uuid --set=root {boot_fs_uuid}
     echo 'Loading Xen ...'
-    multiboot2 {xen} placeholder dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} iommu=verbose,no-igfx console=vga loglvl=all guest_loglvl=all
+    multiboot2 {xen} placeholder {xen_opts}
     echo 'Loading dom0 kernel ...'
-    module2 {kernel} placeholder console=tty0 loglevel=7 iommu=pt intel_iommu=on amd_iommu=on rotten_apple.user_root_uuid={user_root_uuid}{pin_arg}{pciback_hide_arg}
+    module2 {kernel} placeholder {dom0_args}
     echo 'Loading dom0 rootfs (initrd) ...'
     module2 {initrd}
 }}
@@ -204,9 +316,9 @@ menuentry '{entry_name} (recovery, no autostart)' --class xen --class gnu-linux 
     search --no-floppy --fs-uuid --set=root {boot_fs_uuid}
     echo 'Loading Xen (recovery) ...'
     set gfxpayload=keep
-    multiboot2 {xen} placeholder dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} iommu=verbose,no-igfx console=vga sync_console=true loglvl=all guest_loglvl=all noreboot
+    multiboot2 {xen} placeholder {xen_opts_recovery}
     echo 'Loading dom0 kernel (recovery) ...'
-    module2 {kernel} placeholder console=hvc0 earlyprintk=xen loglevel=7 iommu=pt intel_iommu=on amd_iommu=on rotten_apple.user_root_uuid={user_root_uuid}{pin_arg}{pciback_hide_arg} rotten_apple.no_autostart=1
+    module2 {kernel} placeholder {dom0_args_recovery}
     echo 'Loading dom0 rootfs (initrd) ...'
     module2 {initrd}
 }}
@@ -297,7 +409,107 @@ mod tests {
             // Passthrough fixture: exercises the hide_pci path. Production
             // defaults to ParavirtOnly (see dom0_cmdline_omits_pci_hide_in_paravirt).
             display_mode: UserDesktopDisplayMode::PassthroughIfAvailable,
+            // None = BIOS-shaped fixture → multiboot2 entries. The
+            // chainload (UEFI) variant is exercised by the esp_* tests
+            // below with a Some(...) ESP UUID.
+            esp_fs_uuid: None,
         }
+    }
+
+    fn sample_inputs_with_esp() -> GrubEntryInputs {
+        let mut g = sample_inputs();
+        g.esp_fs_uuid = Some("B6D5-2FF2".to_string());
+        g
+    }
+
+    #[test]
+    fn esp_primary_and_recovery_chainload_xen_efi() {
+        // GRUB 2.14 EFI page-faults in its own relocator at the
+        // multiboot2 handoff (2026-07-08 root cause — weeks of black
+        // boots). On UEFI hosts the primary AND recovery entries must
+        // chainload xen.efi (firmware LoadImage path, no relocator),
+        // selecting the xen.cfg section by argument.
+        let s = render_grub_script(&sample_inputs_with_esp());
+        assert!(s.contains("chainloader /EFI/xen/xen.efi thindom0"),
+                "primary entry must chainload xen.efi with section 'thindom0': {s}");
+        assert!(s.contains("chainloader /EFI/xen/xen.efi recovery"),
+                "recovery entry must chainload xen.efi with section 'recovery': {s}");
+        assert!(s.contains("insmod fat") && s.contains("insmod chain"),
+                "chainload entries need fat + chain modules: {s}");
+        assert!(s.contains("search --no-floppy --fs-uuid --set=root B6D5-2FF2"),
+                "chainload entries must search for the ESP UUID: {s}");
+    }
+
+    #[test]
+    fn esp_multiboot2_survives_only_as_labeled_fallback() {
+        // The multiboot2 path stays available for the day a fixed GRUB
+        // ships — but ONLY as an explicitly-labeled fallback entry, so
+        // nobody picks it thinking it's the normal path.
+        let s = render_grub_script(&sample_inputs_with_esp());
+        let mb2_entries: Vec<&str> = s.lines()
+            .filter(|l| l.starts_with("menuentry") && l.contains("multiboot2 fallback"))
+            .collect();
+        assert_eq!(mb2_entries.len(), 1,
+                   "exactly one multiboot2 fallback entry: {s}");
+        // The primary and recovery menuentries must NOT contain multiboot2.
+        let mut in_entry = String::new();
+        for line in s.lines() {
+            if line.starts_with("menuentry") { in_entry = line.to_string(); }
+            if line.trim_start().starts_with("multiboot2 ") {
+                assert!(in_entry.contains("multiboot2 fallback"),
+                        "multiboot2 leaked into a non-fallback entry {in_entry:?}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn esp_fallback_entry_keeps_recovery_flags() {
+        // The fallback is a bring-up lens: recovery-flavored Xen flags
+        // (sync_console, noreboot) + hvc0 dom0 console + gfxpayload=keep.
+        let s = render_grub_script(&sample_inputs_with_esp());
+        let xen_line = s.lines().find(|l| l.trim_start().starts_with("multiboot2 "))
+            .expect("fallback multiboot2 line");
+        assert!(xen_line.contains("sync_console=true") && xen_line.contains("noreboot"),
+                "fallback Xen line must carry recovery flags: {xen_line}");
+        assert!(s.contains("set gfxpayload=keep"),
+                "fallback entry must keep gfxpayload=keep: {s}");
+    }
+
+    #[test]
+    fn exec_tail_offset_matches_first_menuentry_line() {
+        // The `exec tail -n +N $0` self-print idiom: everything from
+        // line N (1-indexed) is emitted into grub.cfg. If a header
+        // comment is added without bumping N, update-grub captures raw
+        // `#` comment lines at top-level (harmless) — but if N grows
+        // past the first menuentry, the primary entry silently
+        // disappears from the boot menu. Pin N == first menuentry line
+        // for BOTH script variants.
+        for s in [render_grub_script(&sample_inputs()),
+                  render_grub_script(&sample_inputs_with_esp())] {
+            let n: usize = s.lines()
+                .find_map(|l| l.strip_prefix("exec tail -n +")
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(|num| num.parse().ok()))
+                .expect("exec tail line");
+            let first_menuentry = s.lines()
+                .position(|l| l.starts_with("menuentry"))
+                .expect("a menuentry") + 1;
+            assert_eq!(n, first_menuentry,
+                       "tail offset {n} must equal first menuentry line \
+                        {first_menuentry}:\n{s}");
+        }
+    }
+
+    #[test]
+    fn bios_hosts_keep_multiboot2_primary_path() {
+        // No ESP (BIOS boot): the GRUB 2.14 EFI relocator bug does not
+        // apply and there is no xen.efi to chainload — the classic
+        // multiboot2 entries remain the primary path.
+        let s = render_grub_script(&sample_inputs());
+        assert!(!s.contains("chainloader"),
+                "BIOS variant must not emit chainloader entries: {s}");
+        assert_eq!(s.matches("multiboot2 /xen").count(), 2,
+                   "BIOS variant keeps primary + recovery multiboot2: {s}");
     }
 
     #[test]

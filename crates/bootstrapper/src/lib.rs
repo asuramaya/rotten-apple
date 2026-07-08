@@ -41,6 +41,7 @@ pub use autowire::install_adjuncts;
 
 pub mod boot_mode;
 pub mod thin_dom0;
+pub mod thin_dom0_efi;
 pub mod thin_dom0_grub;
 pub mod thin_dom0_manifest;
 pub mod thin_dom0_rootfs;

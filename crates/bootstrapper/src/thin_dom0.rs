@@ -60,6 +60,10 @@ use std::path::{Path, PathBuf};
 
 use rotten_apple_detect::{CpuTopology, Detection};
 
+use crate::thin_dom0_efi::{
+    EspStageInputs, ensure_nvram_entry, esp_mount_device_from_mountinfo, render_xen_cfg,
+    stage_esp,
+};
 use crate::thin_dom0_grub::{
     self, GrubEntryInputs, boot_mount_device_from_mountinfo, discover_xen_image_under,
 };
@@ -154,6 +158,16 @@ pub struct ThinDom0Plan {
     /// gets native graphics. None when no framebuffer GPU is detected
     /// (headless server) — the guest then falls back to PV.
     pub framebuffer_gpu_bdf: Option<String>,
+    /// ESP block device (e.g. /dev/nvme0n1p1) when the host is UEFI
+    /// AND a xen-*.efi image exists in /boot. Drives the native-EFI
+    /// boot path (thin_dom0_efi): ESP staging + chainload GRUB entries
+    /// + NVRAM entry. None on BIOS hosts or when the .efi is missing —
+    /// GRUB then keeps the classic multiboot2 entries (which only
+    /// break on GRUB 2.14 *EFI*; see thin_dom0_efi module docs).
+    pub esp_device: Option<PathBuf>,
+    /// vfat UUID of `esp_device` (e.g. "B6D5-2FF2"), for the GRUB
+    /// chainload entries' `search --set=root`.
+    pub esp_fs_uuid: Option<String>,
     /// If true, executors print steps without running them.
     pub dry_run: bool,
 }
@@ -227,6 +241,19 @@ impl ThinDom0Plan {
                  `rotten-apple lift --execute` (the v0.0.1 lift handles \
                  the apt install for you).".to_string()))?;
 
+        // Native-EFI boot path (thin_dom0_efi): needs BOTH a mounted
+        // ESP and the packaged xen-*.efi sibling of the .gz. Either
+        // missing → BIOS-style multiboot2 entries only. The .efi check
+        // happens HERE (plan time) so grub_entry_inputs and execute()
+        // can't disagree about which shape we're in.
+        let esp_device = esp_mount_device_from_mountinfo(&mountinfo)
+            .filter(|_| Path::new("/boot")
+                .join(xen_image_basename.with_extension("efi")).exists());
+        let esp_fs_uuid = match &esp_device {
+            Some(dev) => Some(uuid_for_device(dev)?),
+            None => None,
+        };
+
         // ThinDom0 hard-caps: the dom0 is busybox + xen-tools + cockpit;
         // the planner sizes for "Ubuntu desktop in dom0" which needs
         // far more. Memory is floored at 2 GiB because the current
@@ -262,6 +289,8 @@ impl ThinDom0Plan {
             boot_fs_uuid,
             xen_image_basename,
             framebuffer_gpu_bdf: framebuffer_gpu_bdf(),
+            esp_device,
+            esp_fs_uuid,
             dry_run,
         })
     }
@@ -306,6 +335,7 @@ impl ThinDom0Plan {
             // is visible on the laptop panel. Passthrough (lease the GPU to
             // the guest) is a later explicit step. See [[display_model]].
             display_mode: crate::thin_dom0_manifest::UserDesktopDisplayMode::ParavirtOnly,
+            esp_fs_uuid: self.esp_fs_uuid.clone(),
         }
     }
 
@@ -494,6 +524,37 @@ impl ThinDom0Plan {
 
         // Step 2: copy host kernel.
         copy_kernel(&self.kernel_source, &self.kernel_path, self.dry_run)?;
+
+        // Step 2.5: native-EFI boot path — stage xen.efi + kernel +
+        // rootfs + xen.cfg onto the ESP and ensure the NVRAM entry.
+        // Runs on EVERY lift so the ESP copies track /boot/rotten-apple
+        // (the 2026-07-08 manual bring-up staging went stale on the
+        // very next lift — never again). Skipped on BIOS hosts.
+        if let Some(esp_dev) = &self.esp_device {
+            let esp_inputs = EspStageInputs {
+                esp_mount: PathBuf::from("/boot/efi"),
+                xen_efi_source: Path::new("/boot")
+                    .join(self.xen_image_basename.with_extension("efi")),
+                kernel_source: self.kernel_path.clone(),
+                initrd_source: self.initrd_path.clone(),
+            };
+            let xen_cfg = render_xen_cfg(&self.grub_entry_inputs());
+            stage_esp(&esp_inputs, &xen_cfg, self.dry_run)
+                .map_err(|e| ThinDom0Error::PreFlight(e.to_string()))?;
+            match partition_number_of(esp_dev) {
+                Some(part) => {
+                    let disk = parent_disk_for(esp_dev)?;
+                    ensure_nvram_entry(&disk, part, self.dry_run);
+                }
+                None => eprintln!(
+                    "    [nvram] cannot parse partition number from {} — \
+                     skipping NVRAM entry (GRUB chainload entries still work)",
+                    esp_dev.display()),
+            }
+        } else {
+            eprintln!("    [esp] no ESP + xen-*.efi pair detected — BIOS-style \
+                       multiboot2 GRUB entries only");
+        }
 
         // Step 3: persist the user-desktop manifest on host (in addition to
         // baking it into the cpio). Lets the user `cat /etc/rotten-apple/...`
@@ -836,6 +897,28 @@ fn parent_disk_for(dev: &Path) -> Result<PathBuf> {
         .ok_or_else(|| ThinDom0Error::PreFlight(format!(
             "no row of TYPE=disk in lsblk output for {} — exotic layout?",
             dev.display())))
+}
+
+/// Partition number of a partition device node, for `efibootmgr -p`.
+/// Trailing decimal digits: /dev/nvme0n1p1 → 1, /dev/sda3 → 3. Whole
+/// disks (/dev/nvme0n1) would mis-parse — but callers only pass ESP
+/// partition nodes from mountinfo, and nvme disks end in `n<digit>`
+/// which the `p<digits>` check below rejects.
+fn partition_number_of(dev: &Path) -> Option<u32> {
+    let s = dev.to_string_lossy();
+    let digits: String = s.chars().rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>().chars().rev().collect();
+    if digits.is_empty() || digits.len() == s.len() {
+        return None;
+    }
+    let stem = &s[..s.len() - digits.len()];
+    // nvme whole-disk nodes end in "n<digits>" (namespace); partitions
+    // end in "p<digits>". Plain sd/vd disks end in a letter.
+    if stem.ends_with('n') && stem.contains("nvme") {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Pure parser for `lsblk --inverse -no PATH,TYPE <dev>` output.
@@ -1272,6 +1355,8 @@ mod tests {
             boot_fs_uuid: "boot-uuid-1111".to_string(),
             xen_image_basename: PathBuf::from("xen-4.20-amd64.gz"),
             framebuffer_gpu_bdf: Some("0000:00:02.0".to_string()),
+            esp_device: Some(PathBuf::from("/dev/nvme0n1p1")),
+            esp_fs_uuid: Some("B6D5-2FF2".to_string()),
             dry_run: true,
         }
     }

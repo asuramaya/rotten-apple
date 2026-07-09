@@ -10,6 +10,7 @@
 //! No tokio. std threads + std::os::unix::net + std::sync::mpsc.
 
 pub mod actor;
+pub mod auth;
 pub mod dispatch;
 pub mod engine;
 pub mod oneshot;
@@ -295,11 +296,18 @@ fn handle_connection(
         let _ = write_response(&mut writer, &resp);
         return Ok(());
     }
+    // Per-connection authorization state. The challenge nonce is handed
+    // to the client now so that, once clients sign (task: client-side
+    // request signing), each privileged call binds to THIS connection —
+    // a captured request can't be replayed on another connection.
+    // `mut` arrives with the enforcement seam below (authorize takes &mut).
+    let auth_session = auth::AuthSession::new(auth::fresh_nonce());
     let resp = Response::ok(
         json!({
             "protocol_version": PROTOCOL_VERSION,
             "server":           SERVER_NAME,
             "server_version":   SERVER_VERSION,
+            "auth_nonce":       auth_session.nonce_hex(),
         }),
         hello.id,
     );
@@ -316,6 +324,21 @@ fn handle_connection(
         }
         match read_request(&mut reader) {
             Ok(Some(Ok(req))) => {
+                // INTEGRATION SEAM (task #12): once (a) run() builds a
+                // TrustStore from mesh.toml + self-trust and (b) clients
+                // sign requests, enforce here BEFORE dispatch:
+                //
+                //   let auth = req.auth.as_ref();  // parsed off the wire
+                //   match auth_session.authorize(&req.method, &req.params, auth, &trust) {
+                //       Ok(_) => { /* read-only or authenticated */ }
+                //       Err(_) => { write_response(PERMISSION_DENIED); continue; }
+                //   }
+                //
+                // The authorize() core is fully unit-tested in auth.rs;
+                // it's held out of the live path only until the client
+                // side signs (turning it on now would deny cockpit's
+                // own privileged calls, which don't sign yet).
+                let _ = &auth_session;
                 let resp = dispatch_method(&actor, &engine, &req);
                 write_response(&mut writer, &resp)?;
             }

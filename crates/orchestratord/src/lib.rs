@@ -35,7 +35,7 @@ use crate::protocol::{
     SERVER_VERSION,
 };
 use crate::transport::{
-    DEFAULT_VSOCK_PORT, bind_vsock_listener, read_request, write_response,
+    bind_vsock_listener, read_request, write_response,
 };
 
 pub const DEFAULT_SOCKET_PATH: &str = "/run/rotten-apple.sock";
@@ -50,7 +50,15 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
-            vsock_port: Some(DEFAULT_VSOCK_PORT),
+            // vsock is OFF by default. It binds VSOCK_CID_ANY, reachable
+            // by EVERY guest, and dispatch() has no caller authorization
+            // yet — so a default-on vsock is an unauthenticated guest→host
+            // control plane (domain.kill/create/... from any VM). Opt in
+            // explicitly with --vsock-port ONCE mesh-peer auth (fabric
+            // Ed25519 signed requests, task #12) gates the privileged
+            // methods. Until then the Unix socket (chmod 0660) is the
+            // only surface. See project_orchestratord_auth_mesh_peer.
+            vsock_port: None,
         }
     }
 }
@@ -355,7 +363,14 @@ mod tests {
     fn default_socket_path_is_run() {
         let cfg = DaemonConfig::default();
         assert_eq!(cfg.socket_path, std::path::Path::new(DEFAULT_SOCKET_PATH));
-        assert_eq!(cfg.vsock_port, Some(DEFAULT_VSOCK_PORT));
+    }
+
+    #[test]
+    fn vsock_is_off_by_default() {
+        // Security: default-on vsock binds VSOCK_CID_ANY with no caller
+        // auth = unauthenticated guest→host control plane. Must stay off
+        // until mesh-peer auth (task #12) lands; opt in via --vsock-port.
+        assert_eq!(DaemonConfig::default().vsock_port, None);
     }
 
     #[test]

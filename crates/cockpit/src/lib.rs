@@ -32,7 +32,7 @@ use rotten_apple_backend::{
     GuestHandle, GuestState, GuestStatus, GuestSummary, HypervisorBackend,
 };
 use rotten_apple_backend_xen::XenBackend;
-use rotten_apple_bootstrapper::LiftPlan;
+use rotten_apple_bootstrapper::thin_dom0::ThinDom0Plan;
 use rotten_apple_bootstrapper::boot_mode::{self, BootMode};
 use rotten_apple_detect::Detection;
 use rotten_apple_manifest::Profile;
@@ -44,9 +44,11 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     crossterm::{
+        cursor::MoveTo,
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         execute,
         terminal::{
+            Clear as ClearScreen, ClearType,
             EnterAlternateScreen, LeaveAlternateScreen,
             disable_raw_mode, enable_raw_mode,
         },
@@ -70,7 +72,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const UI_TICK: Duration = Duration::from_millis(50);
 const TOAST_TTL: Duration = Duration::from_secs(4);
 const MAX_EVENTS: usize = 200;
-const DEFAULT_MANIFEST: &str = "/etc/rotten-apple/active.toml";
+/// Default manifest path. Post-ThinDom0 pivot (2026-05-06) this points
+/// at the user-desktop guest description, NOT at active.toml. active.toml
+/// in the v0.0.1 era named the lifted Ubuntu guest itself; in ThinDom0
+/// it describes dom0 (which auto-starting would mean re-launching dom0
+/// — nonsense). user-desktop.toml is what we actually want cockpit to
+/// auto-start when [autostart] enabled = true.
+const DEFAULT_MANIFEST: &str = "/etc/rotten-apple/user-desktop.toml";
 
 #[derive(Clone)]
 pub struct CockpitConfig {
@@ -88,13 +96,6 @@ impl Default for CockpitConfig {
             orchestrator_path: None,
         }
     }
-}
-
-/// Auto-detect the orchestrator binary next to the current executable.
-fn auto_orchestrator_path() -> Option<PathBuf> {
-    let me = std::env::current_exe().ok()?;
-    let sibling = me.parent()?.join("rotten-apple-orchestrator");
-    if sibling.exists() { Some(sibling) } else { None }
 }
 
 /// What the cockpit should be doing on this host right now. Determined
@@ -442,32 +443,21 @@ enum PostUiAction {
     AttachConsole(u32),
 }
 
-fn execute_lift_after_teardown(config: &CockpitConfig) -> io::Result<()> {
-    let orchestrator = config.orchestrator_path.clone()
-        .or_else(auto_orchestrator_path)
-        .ok_or_else(|| io::Error::other(
-            "could not find rotten-apple-orchestrator binary. \
-             Pass --orchestrator <path> to cockpit, or place the binary \
-             next to the cockpit binary."))?;
-
+fn execute_lift_after_teardown(_config: &CockpitConfig) -> io::Result<()> {
     eprintln!();
-    eprintln!("==> running lift from cockpit (TUI torn down so you can");
-    eprintln!("    see apt's output and any prompts).");
+    eprintln!("==> running lift from cockpit (TUI torn down so");
+    eprintln!("    you can see apt + mmdebstrap output).");
     eprintln!();
 
-    let plan = LiftPlan::for_this_host(
-        config.manifest_path.clone(),
-        orchestrator,
-        false, // not dry-run
-    ).map_err(|e| io::Error::other(format!("lift plan: {e}")))?;
-
+    let plan = ThinDom0Plan::for_this_host(false)
+        .map_err(|e| io::Error::other(format!("lift plan: {e}")))?;
     plan.execute()
-        .map_err(|e| io::Error::other(format!("lift execute: {e}")))?;
+        .map_err(|e| io::Error::other(format!("lift install: {e}")))?;
 
     eprintln!();
     eprintln!("==> lift complete. Reboot, hold Shift at GRUB, pick the");
-    eprintln!("    'Ubuntu GNU/Linux, with Xen hypervisor' entry. Then");
-    eprintln!("    relaunch the cockpit and you'll be in Active mode.");
+    eprintln!("    'rotten-apple ThinDom0' entry. Cockpit boots on tty1");
+    eprintln!("    with the user-desktop guest staged for [n] launch.");
     Ok(())
 }
 
@@ -512,7 +502,11 @@ impl Drop for StderrSilencer {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // EnterAlternateScreen is a no-op on a bare Linux VT (fbcon has no smcup),
+    // so hard-clear + home before the first ratatui frame. Otherwise ratatui's
+    // first-frame diff only paints non-blank cells and the boot dmesg bleeds
+    // through everywhere the layout has whitespace.
+    execute!(stdout, EnterAlternateScreen, ClearScreen(ClearType::All), MoveTo(0, 0))?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -557,6 +551,43 @@ fn run_active(
         // the UI reflects current state.
         while let Ok(msg) = msg_rx.try_recv() {
             state.apply(msg);
+        }
+
+        // Autostart: when the manifest enabled it, fire CreateFromManifest
+        // exactly once at the deadline. Backend must be reachable first
+        // (otherwise the worker can't act on the cmd). Skip the autostart
+        // if a domain matching the manifest's name is already running —
+        // re-launches of the cockpit shouldn't double-create the guest.
+        if let Some(deadline) = state.autostart_deadline
+            && Instant::now() >= deadline
+        {
+            state.autostart_deadline = None; // fire-once
+            if state.backend_name.is_some() {
+                let manifest_name = Profile::load(&state.config.manifest_path)
+                    .ok().map(|p| p.name().to_string());
+                let already_running = state.snapshot.as_ref()
+                    .zip(manifest_name.as_ref())
+                    .is_some_and(|(snap, name)|
+                        snap.domains.iter().any(|d| &d.name == name));
+                if already_running {
+                    state.toast = Some((Instant::now(),
+                        "autostart skipped: guest already running".into(),
+                        ToastKind::Info));
+                } else {
+                    let _ = cmd_tx.send(Cmd::CreateFromManifest(
+                        state.config.manifest_path.clone()));
+                    state.toast = Some((Instant::now(),
+                        format!("autostart firing: {}",
+                            state.config.manifest_path.display()),
+                        ToastKind::Info));
+                }
+            } else {
+                // Backend not up yet — re-arm with a 1-second nudge so
+                // we try again shortly. Avoids losing autostart when
+                // libxl/daemon comes up slowly at first boot.
+                state.autostart_deadline = Some(
+                    Instant::now() + std::time::Duration::from_secs(1));
+            }
         }
 
         terminal.draw(|f| render(f, &mut state))?;
@@ -1816,6 +1847,14 @@ struct State {
     /// loop notices it, exits cleanly, and the post-UI dispatcher
     /// runs `xl console <domid>` then re-execs the cockpit.
     pending_console_attach: Option<u32>,
+    /// When the loaded manifest has `[autostart] enabled = true`, this
+    /// is the wall-clock deadline at which the cockpit auto-fires a
+    /// `Cmd::CreateFromManifest` for the user-desktop guest. None when
+    /// autostart is disabled in the manifest, or once it has fired.
+    /// First-boot UX: ThinDom0 cockpit launches → ~5 sec banner →
+    /// guest auto-spawns without keypress. User can press Esc/q to
+    /// cancel during the countdown.
+    autostart_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2159,6 +2198,26 @@ impl State {
         } else {
             Mode::Normal
         };
+        // Autostart: if the manifest says enabled + has a delay, set
+        // a deadline. Honored by the run loop. Loading the manifest
+        // here is best-effort — failures (file missing, parse error)
+        // simply skip autostart; the cockpit otherwise works.
+        // The recovery GRUB entry adds `rotten_apple.no_autostart=1`
+        // to the kernel cmdline; we honor it here so the recovery
+        // boot lands in cockpit on tty1 without auto-firing the guest.
+        let no_autostart_via_cmdline = std::fs::read_to_string("/proc/cmdline")
+            .map(|s| s.split_ascii_whitespace()
+                .any(|tok| tok == "rotten_apple.no_autostart=1"))
+            .unwrap_or(false);
+        let autostart_deadline = if no_autostart_via_cmdline {
+            None
+        } else {
+            Profile::load(&config.manifest_path).ok()
+                .filter(|p| p.autostart.enabled)
+                .and_then(|p| p.autostart.delay_after_boot)
+                .map(|secs| Instant::now() + std::time::Duration::from_secs(secs))
+        };
+
         Self {
             config,
             backend_name: None,
@@ -2177,6 +2236,7 @@ impl State {
             host_specs: rotten_apple_detect::HostSpecs::probe(),
             event_verbosity: EventVerbosity::All,
             pending_console_attach: None,
+            autostart_deadline,
         }
     }
 

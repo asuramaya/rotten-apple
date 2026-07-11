@@ -1,0 +1,12 @@
+[package]
+name = "rotten-apple-dom0-memd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No deps on purpose: the governor is pure std (parse /proc/meminfo, shell
+# out to `xl`, sleep). It compiles into the single `rotten-apple` binary the
+# ThinDom0 cpio ships and runs as its own process, spawned from /init.
+[dependencies]

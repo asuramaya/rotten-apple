@@ -370,6 +370,84 @@ pub struct Policy {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh-aware sections (Phase 0 of the rotten-apple Xen mesh).
+//
+// All three default to "no constraint" so existing single-host manifests
+// parse unchanged. The Phase 0 scheduler honors them locally; Phase 2+
+// gives them mesh-wide meaning. Schema is intentionally minimal — the
+// load-bearing decisions are: anchor (where can this run?), capabilities
+// required (which nodes are eligible?), lease policy (which controller
+// is allowed to do what?). Everything else is over-engineering.
+
+/// Where this manifest is allowed to run, and whether the controller may
+/// move it. The classic stateful-vs-ephemeral split.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct Anchor {
+    /// Node ID this manifest is pinned to. `None` = no pin (scheduler
+    /// may run on any capable node). The literal string `"this-host"`
+    /// is a magic value that the scheduler resolves to the node where
+    /// the manifest was first authored — useful for "stays where I
+    /// made it" without hardcoding a node id.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Whether the controller is allowed to move this manifest to a
+    /// different node. `false` (default, safe) = the controller may
+    /// NOT migrate without explicit operator action; `true` = the
+    /// scheduler may move freely if `node` is also `None`.
+    /// Stateful workloads (your encrypted Ubuntu desktop) leave this
+    /// false; stateless compute (CI runners, scratch dev VMs) opt in.
+    #[serde(default)]
+    pub migratable: bool,
+}
+
+/// What the host must provide for this manifest to run there. Phase 0
+/// uses these for local validation only; Phase 1+ uses them as the
+/// scheduler's eligibility filter when picking a node.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct CapabilitiesRequired {
+    /// Host must have IOMMU enabled (intel_iommu or amd_iommu present
+    /// in the running kernel cmdline). Required for any GPU/PCI
+    /// passthrough; harmless to set on hosts that already have it.
+    #[serde(default)]
+    pub need_iommu: bool,
+    /// Host must expose a GPU of this class. `"iGPU"` | `"dGPU"` |
+    /// `"any"`. `None` = no GPU requirement.
+    #[serde(default)]
+    pub need_gpu_class: Option<String>,
+    /// Host must have at least this many physical cpus available.
+    /// `None` = no minimum (manifest's own `resources.vcpus_active`
+    /// is enforced separately).
+    #[serde(default)]
+    pub need_pcpu_min: Option<u32>,
+    /// Host must have at least this many MB of RAM free for new
+    /// guests. Typically equals or slightly exceeds
+    /// `resources.memory_active`; use it to demand headroom for
+    /// bursty workloads.
+    #[serde(default)]
+    pub need_memory_mb_min: Option<u64>,
+}
+
+/// Who may control this manifest, and what they're allowed to do.
+/// The agent's refusal layer — defense-in-depth so a compromised
+/// controller can't immediately destroy the fleet.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct LeasePolicy {
+    /// Node IDs of controllers permitted to issue events for this
+    /// manifest. Empty = any node holding a valid lease may control
+    /// (the permissive default — fine on a single-user laptop, tighten
+    /// when you add untrusted peers).
+    #[serde(default)]
+    pub controllers_allowed: Vec<String>,
+    /// Wire-protocol operation names the agent will accept from a
+    /// controller for this manifest. Empty = default safe set
+    /// (`assign`, `unassign`, `balloon`, `start`, `shutdown`).
+    /// Sensitive operations (`destroy`, `attach_disk`, `migrate_to`)
+    /// MUST be listed explicitly.
+    #[serde(default)]
+    pub operations_allowed: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // The top-level Profile
 
 #[derive(Debug, Clone, Deserialize)]
@@ -403,6 +481,18 @@ pub struct Profile {
     pub trust: Trust,
     #[serde(default)]
     pub policy: Policy,
+    /// Where this manifest may run; whether the controller may move it.
+    /// Defaults to "no pin, not migratable" — stateful behavior, safe.
+    #[serde(default)]
+    pub anchor: Anchor,
+    /// Host requirements (IOMMU, GPU class, capacity floors). Empty by
+    /// default; the scheduler treats absent fields as "no constraint."
+    #[serde(default, rename = "capabilities_required")]
+    pub capabilities_required: CapabilitiesRequired,
+    /// Refusal layer: which controllers are allowed and which operations
+    /// they may issue. Empty = permissive defaults (single-user laptop).
+    #[serde(default, rename = "lease_policy")]
+    pub lease_policy: LeasePolicy,
 }
 
 impl Profile {
@@ -673,5 +763,153 @@ mod tests {
         let hv  = p.validate_against(&BackendCapabilities::hyperv_reference());
         assert_eq!(xen.len(), 2, "xen issues: {xen:?}");
         assert_eq!(hv.len(), 1,  "hyperv issues: {hv:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mesh-aware sections (Phase 0): anchor, capabilities_required,
+    // lease_policy. Pin defaults + parsing + that absence stays absent.
+
+    fn minimal_profile_toml() -> &'static str {
+        r#"
+            [profile]
+            name = "x"
+            type = "appliance"
+            [resources]
+            memory_active = "1G"
+            memory_idle = "256M"
+            memory_minimum = "128M"
+            vcpus_active = 1
+            vcpus_idle = 1
+            vcpus_minimum = 1
+            [storage]
+            root = { kind = "qcow2", path = "/tmp/x.qcow2" }
+        "#
+    }
+
+    #[test]
+    fn anchor_defaults_to_no_pin_not_migratable() {
+        // Single-host manifests written before the mesh existed must
+        // parse unchanged. Default anchor = no node pin, not migratable
+        // (the safe stateful default — controller can't move it).
+        let p = Profile::from_str(minimal_profile_toml()).unwrap();
+        assert_eq!(p.anchor.node, None,
+                   "default anchor must not pin to any node");
+        assert!(!p.anchor.migratable,
+                "default anchor must not be migratable (safe for stateful)");
+    }
+
+    #[test]
+    fn anchor_round_trips_this_host_magic_value() {
+        // "this-host" is the documented magic value the scheduler
+        // resolves to the authoring node — exercise the literal so a
+        // future refactor doesn't quietly break it.
+        let toml = format!(
+            "{}\n[anchor]\nnode = \"this-host\"\nmigratable = false\n",
+            minimal_profile_toml(),
+        );
+        let p = Profile::from_str(&toml).unwrap();
+        assert_eq!(p.anchor.node.as_deref(), Some("this-host"));
+        assert!(!p.anchor.migratable);
+    }
+
+    #[test]
+    fn anchor_round_trips_explicit_node_id() {
+        // Real cross-node manifests will name a peer's node id. Pin the
+        // shape that mesh.toml-style configs will produce.
+        let toml = format!(
+            "{}\n[anchor]\nnode = \"desk-box-7f3a\"\nmigratable = true\n",
+            minimal_profile_toml(),
+        );
+        let p = Profile::from_str(&toml).unwrap();
+        assert_eq!(p.anchor.node.as_deref(), Some("desk-box-7f3a"));
+        assert!(p.anchor.migratable,
+                "explicit migratable=true must round-trip — opt-in for ephemeral compute");
+    }
+
+    #[test]
+    fn capabilities_required_defaults_are_no_constraint() {
+        // Absent section => every field is None/false/empty so the
+        // scheduler treats it as "any host is eligible." Existing
+        // manifests must parse without growing implicit constraints.
+        let p = Profile::from_str(minimal_profile_toml()).unwrap();
+        let caps = &p.capabilities_required;
+        assert!(!caps.need_iommu);
+        assert_eq!(caps.need_gpu_class, None);
+        assert_eq!(caps.need_pcpu_min, None);
+        assert_eq!(caps.need_memory_mb_min, None);
+    }
+
+    #[test]
+    fn capabilities_required_full_round_trip() {
+        // GPU-passthrough workloads will write all four fields. Pin the
+        // exact TOML keys so a future schema rename surfaces here.
+        let toml = format!(
+            "{}\n[capabilities_required]\n\
+             need_iommu = true\n\
+             need_gpu_class = \"dGPU\"\n\
+             need_pcpu_min = 4\n\
+             need_memory_mb_min = 16384\n",
+            minimal_profile_toml(),
+        );
+        let p = Profile::from_str(&toml).unwrap();
+        let caps = &p.capabilities_required;
+        assert!(caps.need_iommu);
+        assert_eq!(caps.need_gpu_class.as_deref(), Some("dGPU"));
+        assert_eq!(caps.need_pcpu_min, Some(4));
+        assert_eq!(caps.need_memory_mb_min, Some(16384));
+    }
+
+    #[test]
+    fn lease_policy_defaults_are_permissive_empty() {
+        // Empty controllers_allowed = any controller with a valid lease
+        // may control. Empty operations_allowed = the agent applies its
+        // default safe set (assign/unassign/balloon/start/shutdown).
+        // The agent — not the manifest — owns the default safe set, so
+        // here we just pin that the manifest fields default to empty.
+        let p = Profile::from_str(minimal_profile_toml()).unwrap();
+        assert!(p.lease_policy.controllers_allowed.is_empty());
+        assert!(p.lease_policy.operations_allowed.is_empty());
+    }
+
+    #[test]
+    fn lease_policy_round_trips_explicit_controllers_and_ops() {
+        // Defense-in-depth use case: this manifest may only be touched
+        // by named controllers, and only for the listed ops. Anything
+        // else (e.g. `destroy`) is rejected by the agent's refusal layer.
+        let toml = format!(
+            "{}\n[lease_policy]\n\
+             controllers_allowed = [\"laptop-id\", \"desk-box-id\"]\n\
+             operations_allowed = [\"assign\", \"balloon\"]\n",
+            minimal_profile_toml(),
+        );
+        let p = Profile::from_str(&toml).unwrap();
+        assert_eq!(p.lease_policy.controllers_allowed,
+                   vec!["laptop-id".to_string(), "desk-box-id".to_string()]);
+        assert_eq!(p.lease_policy.operations_allowed,
+                   vec!["assign".to_string(), "balloon".to_string()]);
+    }
+
+    #[test]
+    fn mesh_sections_compose_with_existing_fields() {
+        // Realistic shape: a stateful workload pinned to its anchor
+        // node, requiring iGPU passthrough, restricted to a controller
+        // allowlist. Pin that all three sections coexist with the
+        // existing schema (storage, gpu, autostart, etc).
+        let toml = format!(
+            "{}\n\
+             [gpu]\nmode = \"passthrough\"\ndevice = \"0000:00:02.0\"\n\
+             [autostart]\nenabled = true\n\
+             [anchor]\nnode = \"this-host\"\n\
+             [capabilities_required]\nneed_iommu = true\nneed_gpu_class = \"iGPU\"\n\
+             [lease_policy]\ncontrollers_allowed = [\"laptop-id\"]\n",
+            minimal_profile_toml(),
+        );
+        let p = Profile::from_str(&toml).unwrap();
+        assert_eq!(p.gpu.mode, "passthrough");
+        assert!(p.autostart.enabled);
+        assert_eq!(p.anchor.node.as_deref(), Some("this-host"));
+        assert!(p.capabilities_required.need_iommu);
+        assert_eq!(p.lease_policy.controllers_allowed,
+                   vec!["laptop-id".to_string()]);
     }
 }

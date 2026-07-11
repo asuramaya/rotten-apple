@@ -157,13 +157,36 @@ fn invalid_resp(msg: String, id: Value) -> Response {
     Response::err(INVALID_REQUEST, msg, None, id)
 }
 
+/// Directory manifests must live under. `manifest_path` is confined here
+/// so a caller cannot make the (root) daemon read an arbitrary host file.
+const MANIFEST_ROOT: &str = "/etc/rotten-apple";
+
 /// Load a `Profile` from `domain.create` params. Accepts:
-///   - `{ "manifest_path": "/path/to.toml" }` — daemon reads the file.
+///   - `{ "manifest_path": "/etc/rotten-apple/.../x.toml" }` — daemon
+///     reads the file, but ONLY from under `MANIFEST_ROOT`.
 ///   - `{ "profile_inline": "[profile] ..." }` — TOML body inline.
+///
+/// SECURITY: `manifest_path` used to accept any absolute path and echo the
+/// TOML parse error (which quotes the offending source line) back to the
+/// caller — an arbitrary root file-read plus partial content disclosure,
+/// reachable by any client that reaches the socket. We now (a) canonicalize
+/// and require the real path to sit under `MANIFEST_ROOT` (symlinks and `..`
+/// resolved before the check, so neither escapes), and (b) never surface the
+/// parse error text on the wire. Remote/mesh callers should prefer
+/// `profile_inline` and not touch the host filesystem at all.
 fn load_profile(params: &Value) -> Result<Profile, String> {
     if let Some(p) = params.get("manifest_path").and_then(|v| v.as_str()) {
-        return Profile::load(p)
-            .map_err(|e| format!("failed to load manifest {p:?}: {e}"));
+        let real = std::fs::canonicalize(p)
+            .map_err(|_| format!("manifest not found under {MANIFEST_ROOT}"))?;
+        let root = std::fs::canonicalize(MANIFEST_ROOT)
+            .map_err(|_| format!("manifest root {MANIFEST_ROOT} unavailable"))?;
+        if !real.starts_with(&root) {
+            return Err(format!("manifest path must be under {MANIFEST_ROOT}"));
+        }
+        return Profile::load(&real)
+            // Deliberately generic: do NOT interpolate the parse error —
+            // it would echo file contents to the caller.
+            .map_err(|_| "manifest failed to load or parse".to_string());
     }
     if let Some(s) = params.get("profile_inline").and_then(|v| v.as_str()) {
         return Profile::from_str(s)
@@ -258,6 +281,34 @@ mod tests {
     fn teardown(a: crate::actor::ActorHandle, e: crate::engine::EngineHandle) {
         e.shutdown();
         a.shutdown();
+    }
+
+    #[test]
+    fn manifest_path_outside_root_is_rejected() {
+        // A traversal / absolute path outside MANIFEST_ROOT must be
+        // refused BEFORE any read — the daemon runs as root and would
+        // otherwise read arbitrary host files. /etc/passwd exists on the
+        // dev box and canonicalizes cleanly, so it exercises the
+        // starts_with(root) gate rather than the not-found path.
+        let err = load_profile(&json!({"manifest_path": "/etc/passwd"}))
+            .expect_err("must reject a path outside the manifest root");
+        assert!(err.contains(MANIFEST_ROOT), "error should name the root: {err}");
+    }
+
+    #[test]
+    fn manifest_load_error_does_not_echo_contents() {
+        // The failure message for a real-but-unparseable manifest must be
+        // generic — no interpolated parse error, which would quote file
+        // lines back to the caller.
+        let dir = std::path::Path::new(MANIFEST_ROOT);
+        if !dir.exists() { return; } // dev box may lack /etc/rotten-apple
+        let junk = dir.join("__ra_test_not_toml.tmp");
+        if std::fs::write(&junk, b"\x00\x01not toml <<<").is_err() { return; }
+        let err = load_profile(&json!({"manifest_path": junk.to_str().unwrap()}))
+            .expect_err("junk manifest must fail to parse");
+        let _ = std::fs::remove_file(&junk);
+        assert!(!err.contains("not toml") && !err.contains('<'),
+                "error must not echo file contents: {err}");
     }
 
     #[test]

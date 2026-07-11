@@ -48,7 +48,13 @@ pub struct GrubEntryInputs {
     /// Filename of the dom0 initrd relative to the boot partition root.
     pub dom0_initrd: PathBuf,
     /// Xen hypervisor sizing — same numbers the planner emits.
+    /// `dom0_mem_mb` is the BOOT allocation (must survive the initramfs
+    /// unpack peak); `dom0_mem_max_mb` is the `max:` ceiling dom0 may
+    /// balloon UP to post-boot. They differ on purpose: dom0-memd shrinks
+    /// dom0 to its steady floor after boot and grows it back toward this
+    /// ceiling on demand. `max:` must be >= `dom0_mem` or Xen rejects it.
     pub dom0_mem_mb: u64,
+    pub dom0_mem_max_mb: u64,
     pub dom0_vcpus: u32,
     /// UUID of the user's existing root partition. Passed on the dom0
     /// kernel cmdline so the dom0 init can locate the user's filesystem
@@ -96,9 +102,9 @@ pub struct GrubEntryInputs {
 /// entries and the xen.cfg `options=` line on the ESP — one builder so
 /// the two boot paths cannot drift apart.
 pub(crate) fn xen_options_cmdline(g: &GrubEntryInputs, recovery: bool) -> String {
-    let GrubEntryInputs { dom0_mem_mb, dom0_vcpus, .. } = g;
+    let GrubEntryInputs { dom0_mem_mb, dom0_mem_max_mb, dom0_vcpus, .. } = g;
     let mut s = format!(
-        "dom0_mem={dom0_mem_mb}M,max:{dom0_mem_mb}M dom0_max_vcpus={dom0_vcpus} \
+        "dom0_mem={dom0_mem_mb}M,max:{dom0_mem_max_mb}M dom0_max_vcpus={dom0_vcpus} \
          iommu=verbose,no-igfx console=vga");
     if recovery {
         s.push_str(" sync_console=true");
@@ -392,7 +398,7 @@ pub fn discover_xen_image_under(boot_dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thin_dom0::THINDOM0_DOM0_MEM_MB;
+    use crate::thin_dom0::{THINDOM0_DOM0_MEM_MB, THINDOM0_DOM0_MEM_MAX_MB};
 
     fn sample_inputs() -> GrubEntryInputs {
         GrubEntryInputs {
@@ -402,6 +408,7 @@ mod tests {
             dom0_kernel: PathBuf::from("rotten-apple/vmlinuz"),
             dom0_initrd: PathBuf::from("rotten-apple/thin-dom0.cpio.gz"),
             dom0_mem_mb: THINDOM0_DOM0_MEM_MB,
+            dom0_mem_max_mb: THINDOM0_DOM0_MEM_MAX_MB,
             dom0_vcpus: 1,
             user_root_uuid: "9881a7d1-66a6-463d-9433-a7117badbc35".to_string(),
             dom0_pinned_cpu: Some(12),

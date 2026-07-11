@@ -44,9 +44,11 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     crossterm::{
+        cursor::MoveTo,
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         execute,
         terminal::{
+            Clear as ClearScreen, ClearType,
             EnterAlternateScreen, LeaveAlternateScreen,
             disable_raw_mode, enable_raw_mode,
         },
@@ -500,7 +502,11 @@ impl Drop for StderrSilencer {
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // EnterAlternateScreen is a no-op on a bare Linux VT (fbcon has no smcup),
+    // so hard-clear + home before the first ratatui frame. Otherwise ratatui's
+    // first-frame diff only paints non-blank cells and the boot dmesg bleeds
+    // through everywhere the layout has whitespace.
+    execute!(stdout, EnterAlternateScreen, ClearScreen(ClearType::All), MoveTo(0, 0))?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 

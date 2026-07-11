@@ -842,6 +842,7 @@ dependencies = [
  "rotten-apple-bootstrapper",
  "rotten-apple-cockpit",
  "rotten-apple-detect",
+ "rotten-apple-dom0-memd",
  "rotten-apple-fabric",
  "rotten-apple-images",
  "rotten-apple-instances",
@@ -873,6 +874,10 @@ version = "0.0.1"
 dependencies = [
  "tempfile",
 ]
+
+[[package]]
+name = "rotten-apple-dom0-memd"
+version = "0.0.1"
 
 [[package]]
 name = "rotten-apple-fabric"
@@ -945,9 +950,11 @@ dependencies = [
 name = "rotten-apple-orchestratord"
 version = "0.0.1"
 dependencies = [
+ "hex",
  "libc",
  "rotten-apple-backend",
  "rotten-apple-backend-xen",
+ "rotten-apple-fabric",
  "rotten-apple-manifest",
  "serde",
  "serde_json",

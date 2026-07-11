@@ -530,6 +530,16 @@ try "dropbear ecdsa host key" \
 stage "starting dropbear"
 (dropbear -R -s -E -p 22 </dev/null >/var/log/dropbear.log 2>&1) &
 
+# dom0 memory governor: dom0 booted high enough to unpack the initramfs into
+# RAM; hand that headroom back now by ballooning dom0 down to its steady floor,
+# and let it grow again on guest/pressure demand. Backgrounded so it can never
+# wedge the cockpit handoff; xenstored is already up so its `xl` calls work. A
+# dead governor just means dom0 holds its boot size (safe) — so no respawn.
+if [ -x /usr/local/bin/rotten-apple ]; then
+    stage "starting dom0 memory governor"
+    (setsid -c /usr/local/bin/rotten-apple dom0-memd >/var/log/dom0-memd.log 2>&1) &
+fi
+
 dump_xen_logs
 stage "init complete — handing off to cockpit on tty1"
 
@@ -792,6 +802,14 @@ const DOM0_SEED_MODULES: &[&str] = &[
     "bridge", "af_packet",
     // USB host controllers (dock / USB-NIC enumeration)
     "xhci_pci", "xhci_hcd",
+    // input: internal PS/2 keyboard (i8042/atkbd) + USB HID keyboards, so
+    // the cockpit's VT/stdin actually gets key events. Without these the
+    // kernel delivers zero keystrokes and crossterm's event::read() on tty1
+    // sees nothing — a dead cockpit. i2c_hid_acpi covers newer Dell/laptop
+    // internal keyboards wired over I2C instead of PS/2.
+    "i8042", "atkbd", "serio_raw",
+    "usbhid", "hid", "hid_generic",
+    "i2c_hid", "i2c_hid_acpi",
     // wired NICs (common Intel/Realtek laptop + dock)
     "e1000e", "igc", "igb", "r8169",
     // USB-ethernet (dock dongles)

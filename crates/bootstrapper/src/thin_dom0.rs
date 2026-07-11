@@ -94,6 +94,13 @@ use crate::thin_dom0_rootfs::{RootfsSpec, build_rootfs};
 /// ([[feedback_dom0_sizing]]) is a STEADY-STATE target; this is the
 /// transient unpack peak — balloon dom0 down post-boot via `xl mem-set`.
 pub const THINDOM0_DOM0_MEM_MB: u64 = 4096;
+/// The `max:` ceiling on the Xen `dom0_mem=` cmdline — the most RAM dom0 may
+/// balloon UP to post-boot. `dom0-memd` boots dom0 at `THINDOM0_DOM0_MEM_MB`,
+/// shrinks it to the 1 GiB steady floor once the unpack peak is freed, and
+/// grows it back toward this ceiling on guest/pressure demand. Must be >=
+/// `THINDOM0_DOM0_MEM_MB` (Xen rejects a `max:` below the boot allocation)
+/// and should match `dom0-memd`'s `--max-mb`.
+pub const THINDOM0_DOM0_MEM_MAX_MB: u64 = 4096;
 pub const THINDOM0_DOM0_VCPUS: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -110,6 +117,8 @@ pub struct ThinDom0Plan {
     /// orchestrator workload doesn't grow with host RAM, so we don't
     /// follow the v0.0.1 planner here.
     pub dom0_mem_mb: u64,
+    /// `max:` ceiling for post-boot balloon-up (see [`THINDOM0_DOM0_MEM_MAX_MB`]).
+    pub dom0_mem_max_mb: u64,
     pub dom0_vcpus: u32,
     /// Physical CPU index to pin dom0 to. On hybrid CPUs this is the
     /// first E-core (so dom0 never steals P-core cycles from the
@@ -261,6 +270,7 @@ impl ThinDom0Plan {
         // On hybrid CPUs we pin to the first E-core so dom0 never
         // contends with the user-desktop guest's P-cores.
         let dom0_mem_mb = THINDOM0_DOM0_MEM_MB;
+        let dom0_mem_max_mb = THINDOM0_DOM0_MEM_MAX_MB;
         let dom0_vcpus = THINDOM0_DOM0_VCPUS;
         // Pinning is meaningless if we're already inside a Xen domain
         // — /sys/devices/cpu_core/cpus reflects dom0's pinned view,
@@ -277,6 +287,7 @@ impl ThinDom0Plan {
             initrd_path: PathBuf::from("/boot/rotten-apple/thin-dom0.cpio.gz"),
             kernel_source,
             dom0_mem_mb,
+            dom0_mem_max_mb,
             dom0_vcpus,
             dom0_pinned_cpu,
             user_root_device: root.device,
@@ -327,6 +338,7 @@ impl ThinDom0Plan {
             dom0_kernel: strip_boot(&self.kernel_path),
             dom0_initrd: strip_boot(&self.initrd_path),
             dom0_mem_mb: self.dom0_mem_mb,
+            dom0_mem_max_mb: self.dom0_mem_max_mb,
             dom0_vcpus: self.dom0_vcpus,
             user_root_uuid: self.user_root_uuid.clone(),
             dom0_pinned_cpu: self.dom0_pinned_cpu,
@@ -1343,6 +1355,7 @@ mod tests {
             initrd_path: PathBuf::from("/boot/rotten-apple/thin-dom0.cpio.gz"),
             kernel_source: PathBuf::from("/boot/vmlinuz-6.17.0-23-generic"),
             dom0_mem_mb: THINDOM0_DOM0_MEM_MB,
+            dom0_mem_max_mb: THINDOM0_DOM0_MEM_MAX_MB,
             dom0_vcpus: 1,
             dom0_pinned_cpu: Some(12),
             user_root_device: PathBuf::from("/dev/mapper/ubuntu--vg-ubuntu--lv"),

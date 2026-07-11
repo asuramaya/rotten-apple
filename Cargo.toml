@@ -15,6 +15,7 @@ members = [
     "crates/instances",
     "crates/fabric",
     "crates/agent",
+    "crates/dom0-memd",
 ]
 
 [workspace.package]

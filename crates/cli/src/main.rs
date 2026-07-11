@@ -196,6 +196,31 @@ enum Commands {
     /// last few cockpit boot-log lines. Safe to run from any shell —
     /// useful from a recovery getty when cockpit's TUI itself fails.
     CockpitDiag,
+
+    /// dom0 memory governor loop (internal — spawned from /init on a
+    /// ThinDom0). dom0 boots high enough to unpack the initramfs, then this
+    /// balloons Domain-0 down to a steady floor and back up on demand, using
+    /// `xl mem-set 0`. Runs until killed. Defaults mirror the ThinDom0
+    /// doctrine (1 GiB steady) and the `dom0_mem=...,max:` cmdline ceiling;
+    /// keep `--max-mb` in sync with that ceiling.
+    Dom0Memd {
+        #[arg(long, default_value_t = 1024)]
+        steady_mb: u64,
+        #[arg(long, default_value_t = 4096)]
+        max_mb: u64,
+        #[arg(long, default_value_t = 256)]
+        per_guest_mb: u64,
+        #[arg(long, default_value_t = 12)]
+        low_watermark_pct: u64,
+        #[arg(long, default_value_t = 30)]
+        high_watermark_pct: u64,
+        #[arg(long, default_value_t = 256)]
+        step_mb: u64,
+        #[arg(long, default_value_t = 128)]
+        dead_band_mb: u64,
+        #[arg(long, default_value_t = 2)]
+        tick_secs: u64,
+    },
 }
 
 /// CLI-side enum for `rotten-apple boot-mode <…>`. Mirrors
@@ -362,6 +387,34 @@ fn main() -> ExitCode {
         Commands::Rebuild { source } => cmd_rebuild(source),
         Commands::Recover => cmd_recover(),
         Commands::CockpitDiag => cmd_cockpit_diag(),
+        Commands::Dom0Memd {
+            steady_mb, max_mb, per_guest_mb, low_watermark_pct,
+            high_watermark_pct, step_mb, dead_band_mb, tick_secs,
+        } => cmd_dom0_memd(
+            steady_mb, max_mb, per_guest_mb, low_watermark_pct,
+            high_watermark_pct, step_mb, dead_band_mb, tick_secs),
+    }
+}
+
+/// `rotten-apple dom0-memd` — run the dom0 memory governor. Returns only on a
+/// fatal error (loop is otherwise infinite); a dead governor leaves dom0 at
+/// its last size, which is safe, so /init does not respawn it.
+#[allow(clippy::too_many_arguments)]
+fn cmd_dom0_memd(
+    steady_mb: u64, max_mb: u64, per_guest_mb: u64, low_watermark_pct: u64,
+    high_watermark_pct: u64, step_mb: u64, dead_band_mb: u64, tick_secs: u64,
+) -> ExitCode {
+    let cfg = rotten_apple_dom0_memd::GovernorConfig {
+        steady_mb, max_mb, per_guest_mb, low_watermark_pct,
+        high_watermark_pct, step_mb, dead_band_mb,
+        tick: std::time::Duration::from_secs(tick_secs),
+    };
+    match rotten_apple_dom0_memd::run(cfg) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("dom0-memd: fatal: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 

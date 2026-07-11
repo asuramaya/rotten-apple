@@ -269,6 +269,7 @@ mod tests {
             dom0_kernel: PathBuf::from("rotten-apple/vmlinuz"),
             dom0_initrd: PathBuf::from("rotten-apple/thin-dom0.cpio.gz"),
             dom0_mem_mb: 4096,
+            dom0_mem_max_mb: 4096,
             dom0_vcpus: 1,
             user_root_uuid: "9881a7d1-66a6-463d-9433-a7117badbc35".to_string(),
             dom0_pinned_cpu: Some(12),

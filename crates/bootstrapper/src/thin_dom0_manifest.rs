@@ -279,6 +279,7 @@ mod tests {
             initrd_path: PathBuf::from("/boot/rotten-apple/thin-dom0.cpio.gz"),
             kernel_source: PathBuf::from("/boot/vmlinuz-6.17.0-23-generic"),
             dom0_mem_mb: crate::thin_dom0::THINDOM0_DOM0_MEM_MB,
+            dom0_mem_max_mb: crate::thin_dom0::THINDOM0_DOM0_MEM_MAX_MB,
             dom0_vcpus: 1,
             dom0_pinned_cpu: Some(12),
             user_root_device: PathBuf::from("/dev/mapper/ubuntu--vg-ubuntu--lv"),
